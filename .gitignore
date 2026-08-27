@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.DS_Store
+runtime-data/
+vendor/
+*.p8
+*.p12
+.env
+.env.*

@@ -1,0 +1,772 @@
+import { spawn } from 'node:child_process'
+import { createServer } from 'node:net'
+import { access, cp, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
+
+const PACKAGE_NAME = '@deepseek-ai/dsh'
+export const RUNTIME_REGISTRY_URL = 'https://registry.npmjs.org/@deepseek-ai%2fdsh'
+const GITHUB_RELEASE_API = 'https://api.github.com/repos/deepseek-ai/deepseek-harness/releases/tags/'
+const STARTUP_TIMEOUT_MS = 120_000
+const COMMAND_TIMEOUT_MS = 120_000
+export const RUNTIME_INSTALL_TIMEOUT_MS = 100 * 60_000
+const PROGRESS_SAMPLE_MS = 2_000
+const RUNTIME_READY_FILE = '.desktop-runtime-ready.json'
+const PROXY_ENV_KEYS = [
+  'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
+  'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
+  'npm_config_proxy', 'npm_config_https_proxy', 'npm_config_noproxy',
+]
+
+/** Use the host separator when prepending the bundled Node tool directory. */
+export function pathDelimiter(platform = process.platform) {
+  return platform === 'win32' ? ';' : ':'
+}
+
+/** JavaScript CLI entry points must be launched through the bundled Node executable. */
+export function resolveToolInvocation(nodeBinary, toolBinary, args = []) {
+  if (typeof toolBinary !== 'string' || toolBinary.length === 0) {
+    throw new Error('Package-manager entry point is not configured')
+  }
+  if (/\.(?:cjs|mjs|js)$/i.test(toolBinary)) {
+    return { command: nodeBinary, args: [toolBinary, ...args] }
+  }
+  return { command: toolBinary, args }
+}
+
+/** Windows has no catchable POSIX signal; child.kill() performs direct termination there. */
+export function terminateChild(child, { force = false, platform = process.platform } = {}) {
+  if (platform === 'win32') return child.kill()
+  return child.kill(force ? 'SIGKILL' : 'SIGTERM')
+}
+
+/** Reject values that could escape an npm package specifier or version path. */
+export function assertSafeVersion(version) {
+  if (typeof version !== 'string' || !/^[0-9A-Za-z][0-9A-Za-z._+-]*$/.test(version)) {
+    throw new Error(`Invalid Harness version: ${JSON.stringify(version)}`)
+  }
+  return version
+}
+
+/** Extract the loopback URL printed by `dsh web`. */
+export function parseRuntimeUrl(output) {
+  const match = output.match(/dsh web:\s+(http:\/\/127\.0\.0\.1:\d+)/)
+  return match?.[1]
+}
+
+/** Compare exact npm versions. RC ordering is delegated to the registry's dist-tag. */
+export function describeUpdate(activeVersion, latestVersion) {
+  if (activeVersion === latestVersion) return { available: false, version: latestVersion }
+  return { available: true, version: latestVersion }
+}
+
+/** Convert Chromium's system-proxy result into npm-compatible connection attempts. */
+export function networkAttemptsForProxyResolution(proxyResolution = '') {
+  const attempts = []
+  const seen = new Set()
+  const append = attempt => {
+    const key = `${attempt.kind}:${attempt.proxyUrl ?? ''}`
+    if (seen.has(key)) return
+    seen.add(key)
+    attempts.push(attempt)
+  }
+  for (const entry of proxyResolution.split(';').map(value => value.trim()).filter(Boolean)) {
+    if (entry.toUpperCase() === 'DIRECT') {
+      append({ kind: 'direct', label: '直接连接' })
+      continue
+    }
+    const match = entry.match(/^(PROXY|HTTP|HTTPS|SOCKS|SOCKS5)\s+(.+)$/i)
+    if (!match) continue
+    const protocol = match[1].toUpperCase().startsWith('SOCKS') ? 'socks5' : 'http'
+    append({
+      kind: 'proxy',
+      label: '系统代理',
+      proxyUrl: `${protocol}://${match[2]}`,
+    })
+  }
+  if (!attempts.some(attempt => attempt.kind === 'direct')) {
+    append({ kind: 'direct', label: '直接连接' })
+  }
+  return attempts
+}
+
+/** Remove inherited proxy settings for a genuinely direct npm attempt. */
+export function environmentForNetworkAttempt(environment, attempt) {
+  const result = { ...environment }
+  if (attempt.kind === 'proxy') {
+    result.HTTP_PROXY = attempt.proxyUrl
+    result.HTTPS_PROXY = attempt.proxyUrl
+    result.ALL_PROXY = attempt.proxyUrl
+    result.npm_config_proxy = attempt.proxyUrl
+    result.npm_config_https_proxy = attempt.proxyUrl
+  } else if (attempt.kind === 'direct') {
+    for (const key of PROXY_ENV_KEYS) delete result[key]
+    result.npm_config_proxy = 'null'
+    result.npm_config_https_proxy = 'null'
+  }
+  return result
+}
+
+/** Old Harness versions lack --no-open; feature-detect it from their own CLI help. */
+export function runtimeWebArgs(entry, port, helpText) {
+  return [entry, 'web', ...(helpText.includes('--no-open') ? ['--no-open'] : []), '--port', String(port)]
+}
+
+export function isNetworkFailure(error) {
+  const text = error instanceof Error ? `${error.message}\n${error.stderr ?? ''}` : String(error)
+  return /(?:ETIMEDOUT|ESOCKETTIMEDOUT|ECONNRESET|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH|EAI_AGAIN|ENOTFOUND|socket hang up|network timeout|network request|fetch failed|proxy|HTTP 407)/i.test(text)
+}
+
+/** Runtime installs use npm on every platform; pnpm 11's Windows global store requires symlinks. */
+export function runtimeInstallPlan(npmBinary, version) {
+  const safeVersion = assertSafeVersion(version)
+  return {
+    toolBinary: npmBinary,
+    args: [
+      'install',
+      '--omit=dev',
+      '--no-audit',
+      '--no-fund',
+      '--package-lock=false',
+      `${PACKAGE_NAME}@${safeVersion}`,
+    ],
+  }
+}
+
+/** Windows cannot reliably rename or immediately delete a freshly populated module tree. */
+export function runtimeInstallDirectory(target, platform = process.platform, timestamp = Date.now()) {
+  return platform === 'win32' ? target : `${target}.installing-${timestamp}`
+}
+
+/** Retry transient Windows locks and optionally defer cleanup without hiding the original failure. */
+export async function removeRuntimePath(path, {
+  platform = process.platform,
+  remove = rm,
+  required = true,
+  logger = console,
+} = {}) {
+  try {
+    await remove(path, {
+      recursive: true,
+      force: true,
+      ...(platform === 'win32' ? { maxRetries: 12, retryDelay: 250 } : {}),
+    })
+    return true
+  } catch (error) {
+    if (required) throw error
+    logger.warn(`Deferred Runtime cleanup for ${path}: ${error instanceof Error ? error.message : String(error)}`)
+    return false
+  }
+}
+
+const REQUIRED_WEB_CAPABILITIES = [
+  'code-runtime',
+  'goal',
+  'llm-deepseek',
+  'permission',
+  'plan-mode',
+  'plugin-inventory',
+  'session-persistence-jsonl',
+  'skill-filesystem',
+  'subagent-spawn-in-process',
+  'tool-bash',
+  'tool-fs',
+  'tool-pwsh',
+  'tool-skill',
+  'tool-subagent',
+  'tool-web',
+  'tool-workflow',
+  'web-runtime',
+]
+
+const REQUIRED_RUNTIME_PACKAGES = [
+  'dsh-headless',
+  'dsh-mcp-client',
+  'dsh-pwsh-local',
+  'dsh-pwsh-sandbox',
+  'dsh-sandbox-windows-acl',
+  'dsh-skill-filesystem',
+  'dsh-subagent-spawn-in-process',
+  'dsh-terminal-bash',
+  'dsh-tool-pwsh',
+  'dsh-web-app',
+  'dsh-workflow-worker-thread',
+]
+
+/** Confirm that an updated official Web profile still contains every product capability the desktop depends on. */
+export function assertRuntimeCapabilities(configOutput) {
+  const missing = REQUIRED_WEB_CAPABILITIES.filter(id => !configOutput.includes(`id: ${id}`))
+  if (missing.length > 0) throw new Error(`Harness Web profile is missing required capabilities: ${missing.join(', ')}`)
+}
+
+async function assertRuntimePackages(directory) {
+  const packageRoots = [
+    join(directory, 'node_modules', '@deepseek-ai'),
+    join(directory, 'node_modules', '@deepseek-ai', 'dsh', 'node_modules', '@deepseek-ai'),
+  ]
+  const missing = []
+  for (const packageName of REQUIRED_RUNTIME_PACKAGES) {
+    let found = false
+    for (const packageRoot of packageRoots) {
+      try {
+        await access(join(packageRoot, packageName, 'package.json'))
+        found = true
+        break
+      } catch {
+        // pnpm's hoisted linker may keep transitive packages beside dsh instead of at the project root.
+      }
+    }
+    if (!found) missing.push(packageName)
+  }
+  if (missing.length > 0) throw new Error(`Harness installation is missing required packages: ${missing.join(', ')}`)
+}
+
+async function reservePort() {
+  const server = createServer()
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', resolve)
+  })
+  const address = server.address()
+  if (address === null || typeof address === 'string') throw new Error('Unable to reserve a local port')
+  const port = address.port
+  await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+  return port
+}
+
+function run(command, args, options = {}) {
+  const timeoutMs = options.timeoutMs ?? COMMAND_TIMEOUT_MS
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd,
+      env: options.env ?? process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    let stderr = ''
+    const timer = setTimeout(() => {
+      terminateChild(child)
+      reject(new Error(`${command} timed out after ${timeoutMs}ms`))
+    }, timeoutMs)
+    child.stdout.on('data', chunk => {
+      const text = chunk.toString()
+      stdout += text
+      options.onOutput?.({ stream: 'stdout', text })
+    })
+    child.stderr.on('data', chunk => {
+      const text = chunk.toString()
+      stderr += text
+      options.onOutput?.({ stream: 'stderr', text })
+    })
+    child.once('error', error => {
+      clearTimeout(timer)
+      reject(error)
+    })
+    child.once('exit', code => {
+      clearTimeout(timer)
+      if (code === 0) resolve({ stdout, stderr })
+      else {
+        const error = new Error(`${command} exited with ${code}\n${stderr || stdout}`)
+        error.exitCode = code
+        error.stdout = stdout
+        error.stderr = stderr
+        reject(error)
+      }
+    })
+  })
+}
+
+async function directorySize(path) {
+  let total = 0
+  const directories = [path]
+  while (directories.length > 0) {
+    const directory = directories.pop()
+    let entries
+    try {
+      entries = await readdir(directory, { withFileTypes: true })
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue
+      throw error
+    }
+    for (const entry of entries) {
+      const child = join(directory, entry.name)
+      if (entry.isDirectory()) directories.push(child)
+      else if (entry.isFile()) total += (await stat(child)).size
+    }
+  }
+  return total
+}
+
+function stageError(stage, message, cause, details = {}) {
+  const error = new Error(message, { cause })
+  error.stage = stage
+  Object.assign(error, details)
+  return error
+}
+
+export class RuntimeManager {
+  constructor({
+    root,
+    nodeBinary,
+    npmBinary,
+    pnpmBinary,
+    toolDirectory,
+    runtimePreload,
+    resolveProxy,
+    systemFetch,
+    directFetch,
+    onProgress,
+    platform = process.platform,
+    logger = console,
+  }) {
+    this.root = root
+    this.nodeBinary = nodeBinary
+    this.npmBinary = npmBinary
+    this.pnpmBinary = pnpmBinary
+    this.toolDirectory = toolDirectory
+    this.runtimePreload = runtimePreload
+    this.resolveProxy = resolveProxy
+    this.systemFetch = systemFetch
+    this.directFetch = directFetch ?? fetch
+    this.onProgress = onProgress
+    this.platform = platform
+    this.logger = logger
+    this.process = undefined
+    this.currentUrl = undefined
+  }
+
+  reportProgress(progress) {
+    this.onProgress?.({ timestamp: Date.now(), ...progress })
+  }
+
+  async runTool(toolBinary, args, options = {}) {
+    const invocation = resolveToolInvocation(this.nodeBinary, toolBinary, args)
+    return run(invocation.command, invocation.args, options)
+  }
+
+  get versionsRoot() { return join(this.root, 'versions') }
+  get statePath() { return join(this.root, 'active.json') }
+  get harnessHome() { return join(this.root, 'harness-home') }
+
+  /**
+   * Windows keeps each Harness home below its matching installation. Node can
+   * then resolve profile plugins by walking up to the installation's real
+   * node_modules without creating privileged symlinks or junctions.
+   */
+  harnessHomeForVersion(version) {
+    if (this.platform !== 'win32') return this.harnessHome
+    return join(this.runtimeDirectory(version), '.harness-home')
+  }
+
+  runtimeNodeArgs(args) {
+    if (this.platform !== 'win32' || this.runtimePreload === undefined) return args
+    return ['--require', this.runtimePreload, ...args]
+  }
+
+  async initialize() {
+    await mkdir(this.versionsRoot, { recursive: true })
+    if (this.platform !== 'win32') await mkdir(this.harnessHome, { recursive: true })
+  }
+
+  async getActiveVersion() {
+    return (await this.getState())?.version
+  }
+
+  async getState() {
+    try {
+      const state = JSON.parse(await readFile(this.statePath, 'utf8'))
+      const version = assertSafeVersion(state.version)
+      const previousVersion = state.previousVersion === undefined ? undefined : assertSafeVersion(state.previousVersion)
+      const backupPath = typeof state.backupPath === 'string' ? state.backupPath : undefined
+      return { version, previousVersion, backupPath }
+    } catch (error) {
+      if (error?.code === 'ENOENT') return undefined
+      throw error
+    }
+  }
+
+  async getLatestVersion() {
+    const attempts = [
+      ...(this.systemFetch ? [{ label: '系统网络（含代理）', fetcher: this.systemFetch }] : []),
+      { label: '直接连接', fetcher: this.directFetch },
+    ]
+    const attemptFailures = []
+    for (const attempt of attempts) {
+      try {
+        const response = await attempt.fetcher(RUNTIME_REGISTRY_URL, {
+          headers: { accept: 'application/vnd.npm.install-v1+json' },
+          signal: AbortSignal.timeout(15_000),
+        })
+        if (!response.ok) throw new Error(`npm registry returned HTTP ${response.status}`)
+        const metadata = await response.json()
+        return assertSafeVersion(metadata['dist-tags']?.latest)
+      } catch (error) {
+        attemptFailures.push({ label: attempt.label, error })
+      }
+    }
+    throw stageError('check', '无法从官方 npm Registry 获取最新 Harness 版本', attemptFailures.at(-1)?.error, { attemptFailures })
+  }
+
+  async checkForUpdate() {
+    const [activeVersion, latestVersion] = await Promise.all([
+      this.getActiveVersion(),
+      this.getLatestVersion(),
+    ])
+    const update = { activeVersion, ...describeUpdate(activeVersion, latestVersion) }
+    if (update.available) update.releaseNotes = await this.getReleaseNotes(latestVersion)
+    return update
+  }
+
+  async getReleaseNotes(version) {
+    const safeVersion = assertSafeVersion(version)
+    for (const tag of [safeVersion, `v${safeVersion}`]) {
+      const fetchers = [
+        ...(this.systemFetch ? [this.systemFetch] : []),
+        this.directFetch,
+      ]
+      for (const fetcher of fetchers) {
+        try {
+          const response = await fetcher(`${GITHUB_RELEASE_API}${encodeURIComponent(tag)}`, {
+            headers: {
+              accept: 'application/vnd.github+json',
+              'user-agent': 'DeepSeek-Harness-Desktop',
+              'x-github-api-version': '2022-11-28',
+            },
+            signal: AbortSignal.timeout(15_000),
+          })
+          if (response.status === 404) break
+          if (!response.ok) continue
+          const release = await response.json()
+          const body = typeof release.body === 'string' ? release.body.trim() : ''
+          if (!body) return undefined
+          return {
+            title: typeof release.name === 'string' && release.name.trim() ? release.name.trim() : tag,
+            body,
+            url: typeof release.html_url === 'string' ? release.html_url : undefined,
+          }
+        } catch {
+          // Release notes are optional; try the next network route or tag.
+        }
+      }
+    }
+    return undefined
+  }
+
+  runtimeDirectory(version) {
+    return join(this.versionsRoot, assertSafeVersion(version))
+  }
+
+  runtimeEntry(version) {
+    return join(this.runtimeDirectory(version), 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+  }
+
+  async isInstalledRuntimeReady(target, version) {
+    try {
+      const packageJson = JSON.parse(await readFile(join(target, 'node_modules', '@deepseek-ai', 'dsh', 'package.json'), 'utf8'))
+      if (packageJson.version !== version) return false
+      if (this.platform !== 'win32') return true
+      const ready = JSON.parse(await readFile(join(target, RUNTIME_READY_FILE), 'utf8'))
+      return ready.version === version
+    } catch (error) {
+      if (error?.code === 'ENOENT' || error instanceof SyntaxError) return false
+      throw error
+    }
+  }
+
+  async install(version) {
+    const safeVersion = assertSafeVersion(version)
+    const target = this.runtimeDirectory(safeVersion)
+    if (await this.isInstalledRuntimeReady(target, safeVersion)) return target
+
+    const installDirectory = runtimeInstallDirectory(target, this.platform)
+    const proxyResolution = await this.resolveProxy?.(RUNTIME_REGISTRY_URL).catch(error => {
+      this.logger.warn(`Unable to resolve system proxy: ${error instanceof Error ? error.message : String(error)}`)
+      return ''
+    }) ?? ''
+    const networkAttempts = networkAttemptsForProxyResolution(proxyResolution)
+    const attemptFailures = []
+    try {
+      const installPlan = runtimeInstallPlan(this.npmBinary, safeVersion)
+      for (const [index, attempt] of networkAttempts.entries()) {
+        await removeRuntimePath(installDirectory, { platform: this.platform, logger: this.logger })
+        await mkdir(installDirectory, { recursive: true })
+        await writeFile(join(installDirectory, 'package.json'), JSON.stringify({ private: true }, null, 2) + '\n')
+        const startedAt = Date.now()
+        let lastSize = 0
+        let lastSampleAt = startedAt
+        let sampling = false
+        const emitSample = async () => {
+          if (sampling) return
+          sampling = true
+          try {
+            const processedBytes = await directorySize(installDirectory)
+            const now = Date.now()
+            const bytesPerSecond = Math.max(0, processedBytes - lastSize) / Math.max(0.001, (now - lastSampleAt) / 1000)
+            lastSize = processedBytes
+            lastSampleAt = now
+            this.reportProgress({
+              phase: 'download',
+              title: `正在安装 Harness ${safeVersion}`,
+              message: `${attempt.label} · 下载并解压依赖`,
+              attempt: index + 1,
+              attemptCount: networkAttempts.length,
+              elapsedMs: now - startedAt,
+              processedBytes,
+              bytesPerSecond,
+              indeterminate: true,
+            })
+          } catch (error) {
+            this.logger.warn(`Unable to sample Runtime progress: ${error instanceof Error ? error.message : String(error)}`)
+          } finally {
+            sampling = false
+          }
+        }
+        await emitSample()
+        const sampleTimer = setInterval(() => { void emitSample() }, PROGRESS_SAMPLE_MS)
+        try {
+          await this.runTool(installPlan.toolBinary, installPlan.args, {
+            cwd: installDirectory,
+            timeoutMs: RUNTIME_INSTALL_TIMEOUT_MS,
+            env: environmentForNetworkAttempt(this.runtimeEnvironment(), attempt),
+          })
+          clearInterval(sampleTimer)
+          await emitSample()
+          break
+        } catch (error) {
+          clearInterval(sampleTimer)
+          attemptFailures.push({ label: attempt.label, error })
+          const canRetry = index < networkAttempts.length - 1 && isNetworkFailure(error)
+          if (!canRetry) {
+            throw stageError(
+              'download',
+              `Harness ${safeVersion} 下载或安装失败`,
+              error,
+              { attemptFailures },
+            )
+          }
+          this.reportProgress({
+            phase: 'retry',
+            title: `正在切换下载线路`,
+            message: `${attempt.label}失败，即将尝试${networkAttempts[index + 1].label}`,
+            attempt: index + 1,
+            attemptCount: networkAttempts.length,
+            indeterminate: true,
+          })
+        }
+      }
+
+      const entry = join(installDirectory, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+      this.reportProgress({ phase: 'verify', title: '正在校验更新', message: '检查 Runtime 版本与完整能力', indeterminate: true })
+      await assertRuntimePackages(installDirectory)
+      const verificationHome = join(installDirectory, '.verification-home')
+      const verificationEnvironment = this.runtimeEnvironment({
+        harnessHome: verificationHome,
+        runtimeDirectory: installDirectory,
+      })
+      const verification = await run(this.nodeBinary, this.runtimeNodeArgs([entry, '--version']), {
+        cwd: installDirectory,
+        env: verificationEnvironment,
+      })
+      if (verification.stdout.trim() !== safeVersion) {
+        throw new Error(`Installed Harness reported ${verification.stdout.trim()}, expected ${safeVersion}`)
+      }
+      await this.runTool(this.npmBinary, ['--version'], { env: this.runtimeEnvironment() })
+      if (this.pnpmBinary !== undefined) {
+        await this.runTool(this.pnpmBinary, ['--version'], { env: this.runtimeEnvironment() })
+      }
+      const configVerification = await run(this.nodeBinary, this.runtimeNodeArgs([entry, 'web', '--dump-default-config']), {
+        cwd: installDirectory,
+        env: verificationEnvironment,
+      })
+      assertRuntimeCapabilities(configVerification.stdout)
+      await removeRuntimePath(verificationHome, {
+        platform: this.platform,
+        required: false,
+        logger: this.logger,
+      })
+      if (this.platform === 'win32') {
+        await writeFile(
+          join(target, RUNTIME_READY_FILE),
+          JSON.stringify({ version: safeVersion, verifiedAt: new Date().toISOString() }, null, 2) + '\n',
+        )
+      } else {
+        this.reportProgress({ phase: 'activate', title: '正在启用更新', message: '切换到已校验的新 Runtime', indeterminate: true })
+        await removeRuntimePath(target, { platform: this.platform, logger: this.logger })
+        await rename(installDirectory, target)
+      }
+      return target
+    } catch (error) {
+      await removeRuntimePath(installDirectory, {
+        platform: this.platform,
+        required: false,
+        logger: this.logger,
+      })
+      if (error?.stage) throw error
+      throw stageError('verify', `Harness ${safeVersion} 校验或启用失败`, error)
+    }
+  }
+
+  async activate(version, history = {}) {
+    const safeVersion = assertSafeVersion(version)
+    await this.install(safeVersion)
+    const nextState = `${this.statePath}.next`
+    await mkdir(dirname(this.statePath), { recursive: true })
+    await writeFile(nextState, JSON.stringify({ version: safeVersion, ...history }, null, 2) + '\n')
+    await rename(nextState, this.statePath)
+    return safeVersion
+  }
+
+  async backupHarnessHome(version, label) {
+    const harnessHome = this.harnessHomeForVersion(version)
+    await mkdir(harnessHome, { recursive: true })
+    const backupPath = join(this.root, 'backups', `${Date.now()}-${label}`)
+    await mkdir(dirname(backupPath), { recursive: true })
+    await cp(harnessHome, backupPath, { recursive: true, force: false, preserveTimestamps: true })
+    return backupPath
+  }
+
+  async restoreHarnessHome(version, backupPath) {
+    const harnessHome = this.harnessHomeForVersion(version)
+    await rm(harnessHome, { recursive: true, force: true })
+    await cp(backupPath, harnessHome, { recursive: true, force: false, preserveTimestamps: true })
+  }
+
+  async copyHarnessHome(fromVersion, toVersion) {
+    if (this.platform !== 'win32') return
+    const source = this.harnessHomeForVersion(fromVersion)
+    const destination = this.harnessHomeForVersion(toVersion)
+    await mkdir(source, { recursive: true })
+    await rm(destination, { recursive: true, force: true })
+    await cp(source, destination, { recursive: true, force: false, preserveTimestamps: true })
+  }
+
+  runtimeEnvironment({ harnessHome = this.harnessHome, runtimeDirectory } = {}) {
+    const toolPath = this.toolDirectory === undefined
+      ? process.env.PATH ?? ''
+      : `${this.toolDirectory}${pathDelimiter(this.platform)}${process.env.PATH ?? ''}`
+    const environment = {
+      ...process.env,
+      PATH: toolPath,
+      ...(this.toolDirectory === undefined || this.platform === 'win32' ? {} : { PNPM_HOME: this.toolDirectory }),
+      DSH_HOME: harnessHome,
+      ...(runtimeDirectory === undefined ? {} : { DSH_DESKTOP_RUNTIME_DIRECTORY: runtimeDirectory }),
+      ...(this.platform === 'win32' ? { DSH_DESKTOP_LINKLESS_PROFILE_FALLBACK: '1' } : {}),
+      DSH_TELEMETRY_MODE: process.env.DSH_TELEMETRY_MODE ?? 'DISABLED',
+    }
+    if (this.platform === 'win32') delete environment.PNPM_HOME
+    return environment
+  }
+
+  async start(version) {
+    await this.stop()
+    const safeVersion = assertSafeVersion(version)
+    const runtimeDirectory = this.runtimeDirectory(safeVersion)
+    const harnessHome = this.harnessHomeForVersion(safeVersion)
+    await mkdir(harnessHome, { recursive: true })
+    const entry = this.runtimeEntry(safeVersion)
+    const port = await reservePort()
+    this.reportProgress({ phase: 'start', title: `正在启动 Harness ${safeVersion}`, message: '等待本机服务就绪', indeterminate: true })
+    const help = await run(this.nodeBinary, this.runtimeNodeArgs([entry, 'web', '--help']), {
+      cwd: process.env.DSH_DESKTOP_WORKSPACE || process.cwd(),
+      env: this.runtimeEnvironment({ harnessHome, runtimeDirectory }),
+    })
+    const webArgs = runtimeWebArgs(entry, port, `${help.stdout}\n${help.stderr}`)
+    const child = spawn(this.nodeBinary, this.runtimeNodeArgs(webArgs), {
+      cwd: process.env.DSH_DESKTOP_WORKSPACE || process.cwd(),
+      env: this.runtimeEnvironment({ harnessHome, runtimeDirectory }),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    this.process = child
+
+    const url = await new Promise((resolve, reject) => {
+      let output = ''
+      const timer = setTimeout(() => {
+        terminateChild(child)
+        reject(new Error(`Harness did not start within ${STARTUP_TIMEOUT_MS / 1000} seconds`))
+      }, STARTUP_TIMEOUT_MS)
+      const onData = chunk => {
+        output += chunk.toString()
+        const parsed = parseRuntimeUrl(output)
+        if (parsed !== undefined) {
+          clearTimeout(timer)
+          resolve(parsed)
+        }
+      }
+      child.stdout.on('data', onData)
+      child.stderr.on('data', chunk => this.logger.warn(chunk.toString().trim()))
+      child.once('error', error => {
+        clearTimeout(timer)
+        reject(error)
+      })
+      child.once('exit', code => {
+        if (this.currentUrl === undefined) {
+          clearTimeout(timer)
+          reject(new Error(`Harness exited during startup with code ${code}\n${output}`))
+        }
+      })
+    })
+    this.currentUrl = url
+    this.reportProgress({ phase: 'complete', title: `Harness ${safeVersion} 已就绪`, message: '正在打开桌面界面', indeterminate: false, percent: 100 })
+    child.once('exit', () => {
+      if (this.process === child) {
+        this.process = undefined
+        this.currentUrl = undefined
+      }
+    })
+    return url
+  }
+
+  async restart(version) {
+    await this.stop()
+    return this.start(version)
+  }
+
+  async stop() {
+    const child = this.process
+    this.process = undefined
+    this.currentUrl = undefined
+    if (child === undefined || child.exitCode !== null) return
+    terminateChild(child)
+    await Promise.race([
+      new Promise(resolve => child.once('exit', resolve)),
+      new Promise(resolve => setTimeout(resolve, 5_000)),
+    ])
+    if (child.exitCode === null) terminateChild(child, { force: true })
+  }
+
+  async updateAndRestart(version) {
+    const previousState = await this.getState()
+    const previous = previousState?.version
+    const backupPath = previous === undefined
+      ? undefined
+      : await this.backupHarnessHome(previous, `${previous}-to-${assertSafeVersion(version)}`)
+    await this.install(version)
+    if (previous !== undefined) await this.copyHarnessHome(previous, version)
+    try {
+      const url = await this.start(version)
+      await this.activate(version, { previousVersion: previous, backupPath })
+      return { version, url, previous, backupPath }
+    } catch (error) {
+      await this.stop()
+      if (this.platform === 'win32') {
+        await rm(this.harnessHomeForVersion(version), { recursive: true, force: true })
+      } else if (backupPath !== undefined && previous !== undefined) {
+        await this.restoreHarnessHome(previous, backupPath)
+      }
+      if (previous !== undefined) await this.start(previous)
+      if (!error?.stage) error.stage = 'start'
+      throw error
+    }
+  }
+
+  async rollback() {
+    const state = await this.getState()
+    if (state?.previousVersion === undefined || state.backupPath === undefined) {
+      throw new Error('No previous Harness update is available to roll back')
+    }
+    await this.stop()
+    await this.restoreHarnessHome(state.previousVersion, state.backupPath)
+    const url = await this.start(state.previousVersion)
+    await this.activate(state.previousVersion)
+    return { version: state.previousVersion, url }
+  }
+}

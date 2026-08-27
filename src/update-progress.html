@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>正在更新 DeepSeek Harness</title>
+    <style>
+      :root { color-scheme: light dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      * { box-sizing: border-box; }
+      body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 40px; background: #f4f7fb; color: #172033; }
+      main { width: min(640px, 100%); padding: 40px; border: 1px solid #dfe5ef; border-radius: 20px; background: rgba(255,255,255,.88); box-shadow: 0 20px 70px rgba(25,42,70,.12); }
+      .top { display: flex; gap: 18px; align-items: center; }
+      .mark { width: 58px; height: 58px; flex: none; }
+      .eyebrow { margin: 0 0 5px; color: #2864ee; font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+      h1 { margin: 0; font-size: 24px; letter-spacing: -.02em; }
+      .message { margin: 24px 0 0; min-height: 24px; color: #566176; line-height: 1.6; }
+      .bar { position: relative; height: 9px; margin-top: 18px; overflow: hidden; border-radius: 999px; background: #e2e8f2; }
+      .bar > span { position: absolute; inset: 0 auto 0 0; width: 38%; border-radius: inherit; background: linear-gradient(90deg, #2864ee, #66a0ff); animation: travel 1.35s ease-in-out infinite; }
+      .bar.determinate > span { animation: none; transition: width .25s ease; }
+      .metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 18px; }
+      .metric { padding: 14px; border-radius: 12px; background: #f2f5fa; }
+      .metric-label { color: #7a8598; font-size: 12px; }
+      .metric-value { margin-top: 5px; font-size: 14px; font-weight: 650; font-variant-numeric: tabular-nums; }
+      .notice { margin: 18px 0 0; color: #7a8598; font-size: 12px; line-height: 1.6; }
+      @keyframes travel { from { transform: translateX(-105%); } to { transform: translateX(265%); } }
+      @media (prefers-color-scheme: dark) {
+        body { background: #101319; color: #edf1f8; }
+        main { border-color: #2a303b; background: rgba(24,28,36,.92); box-shadow: 0 20px 70px rgba(0,0,0,.3); }
+        .message { color: #adb6c6; } .bar { background: #2b3340; } .metric { background: #202630; } .metric-label, .notice { color: #8f99aa; }
+      }
+      @media (max-width: 620px) { body { padding: 20px; } main { padding: 28px; } .metrics { grid-template-columns: 1fr; } }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="top">
+        <img class="mark" src="./fish-black.svg" alt="DeepSeek 黑色金鱼图标">
+        <div>
+          <p class="eyebrow">Harness Runtime Update</p>
+          <h1 id="title">正在准备更新</h1>
+        </div>
+      </div>
+      <p class="message" id="message">正在连接官方 npm Registry…</p>
+      <div class="bar" id="bar" role="progressbar" aria-label="更新进度"><span></span></div>
+      <div class="metrics">
+        <div class="metric"><div class="metric-label">网络线路</div><div class="metric-value" id="route">正在检测</div></div>
+        <div class="metric"><div class="metric-label">已处理数据</div><div class="metric-value" id="processed">0 B</div></div>
+        <div class="metric"><div class="metric-label">估算下载/写入速度</div><div class="metric-value" id="speed">等待数据</div></div>
+      </div>
+      <p class="notice" id="notice">依赖总大小由 npm 动态决定，因此进度条在下载阶段为活动状态；数据量与速度按安装目录实际写入估算。</p>
+    </main>
+    <script>
+      const targetVersion = new URLSearchParams(location.search).get('version')
+      const title = document.querySelector('#title')
+      const message = document.querySelector('#message')
+      const route = document.querySelector('#route')
+      const processed = document.querySelector('#processed')
+      const speed = document.querySelector('#speed')
+      const bar = document.querySelector('#bar')
+      const fill = bar.querySelector('span')
+
+      function bytes(value) {
+        if (!Number.isFinite(value) || value <= 0) return '0 B'
+        const units = ['B', 'KB', 'MB', 'GB']
+        const unit = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1)
+        return `${(value / 1024 ** unit).toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`
+      }
+      if (targetVersion) title.textContent = `正在更新到 Harness ${targetVersion}`
+      window.desktopHarness.onUpdateProgress(progress => {
+        if (progress.title) title.textContent = progress.title
+        if (progress.message) message.textContent = progress.message
+        if (progress.message?.includes('代理')) route.textContent = '系统代理'
+        else if (progress.message?.includes('直接连接')) route.textContent = '直接连接'
+        if (Number.isFinite(progress.processedBytes)) processed.textContent = bytes(progress.processedBytes)
+        if (Number.isFinite(progress.bytesPerSecond) && progress.bytesPerSecond > 0) speed.textContent = `${bytes(progress.bytesPerSecond)}/s`
+        if (Number.isFinite(progress.percent)) {
+          bar.classList.add('determinate')
+          bar.setAttribute('aria-valuenow', String(progress.percent))
+          fill.style.width = `${progress.percent}%`
+        } else {
+          bar.classList.remove('determinate')
+          bar.removeAttribute('aria-valuenow')
+          fill.style.removeProperty('width')
+        }
+      })
+    </script>
+  </body>
+</html>
