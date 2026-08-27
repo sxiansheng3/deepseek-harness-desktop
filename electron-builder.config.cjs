@@ -1,4 +1,5 @@
 const path = require('node:path')
+const notaryProfile = process.env.DSH_DESKTOP_NOTARY_PROFILE?.trim()
 
 module.exports = {
   appId: 'com.songtao.deepseek-harness-desktop',
@@ -20,6 +21,7 @@ module.exports = {
     category: 'public.app-category.developer-tools',
     icon: 'build/icon.icns',
     hardenedRuntime: true,
+    notarize: notaryProfile ? { keychainProfile: notaryProfile } : false,
     entitlements: 'build/entitlements.mac.plist',
     entitlementsInherit: 'build/entitlements.mac.plist',
     gatekeeperAssess: false,
