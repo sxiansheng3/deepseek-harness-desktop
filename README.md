@@ -21,6 +21,9 @@ DeepSeek Harness Desktop is an Electron shell around the official, open-source D
 - Verifies the official Web profile still contains the model, MCP, plan, persistence, Skill, subagent, terminal, filesystem, web, workflow, and UI capabilities before accepting an update.
 - Stops the Runtime when the desktop application quits.
 - Starts newer Harness Web Runtimes with their official `--no-open` switch so the desktop application does not also launch the default browser; older Runtimes are detected and remain compatible.
+- Lets newer Harness Runtimes ask the operating system for a free port directly, avoiding a reserve-then-release race during restart.
+- If a macOS/Linux update finds an incompatible shared module fallback from an older Runtime, moves only that generated fallback into the recoverable update backups, regenerates it, and retries startup once. Sessions, settings, credentials, profile patches, and profile-local plugins are left unchanged.
+- Captures sanitized startup stdout and stderr so a failed update reports the actual upstream startup error without exposing one-time tokens or credentials.
 - Preserves the official one-time local launch token introduced by newer Harness Runtimes while continuing to reject non-loopback startup URLs.
 - Forces Harness session telemetry to `DISABLED` unless the deployment explicitly overrides it.
 - Uses the DeepSeek fish mark from the official Harness repository. This desktop application is an independent build and must not be represented as an official DeepSeek distribution.

@@ -10,19 +10,23 @@ import {
   parseRuntimeUrl,
   parseRuntimeReleaseFeed,
   pathDelimiter,
+  quarantineProfileModuleFallback,
   removeRuntimePath,
   resolveToolInvocation,
   runtimeInstallDirectory,
   runtimeInstallPlan,
   runtimeVersionFromReleaseTag,
   RUNTIME_INSTALL_TIMEOUT_MS,
+  runtimeStartupError,
+  runtimeSupportsDynamicPort,
   runtimeWebArgs,
+  sanitizeRuntimeOutput,
   RuntimeManager,
   terminateChild,
 } from '../src/runtime-manager.js'
 import { bundledToolDirectory, bundledToolPath } from '../src/tool-layout.js'
 import { createRequire } from 'node:module'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -96,6 +100,112 @@ test('uses the official no-open flag only when the installed Runtime supports it
     runtimeWebArgs('/runtime/dsh.js', 3080, 'Options:\n  --no-open\n  --port <port>'),
     ['/runtime/dsh.js', 'web', '--no-open', '--port', '3080'],
   )
+  const dynamicPortHelp = 'Options:\n  --no-open\n  --port <port>  listen port; pass 0 to let the OS pick a free one'
+  assert.equal(runtimeSupportsDynamicPort(dynamicPortHelp), true)
+  assert.deepEqual(
+    runtimeWebArgs('/runtime/dsh.js', 3080, dynamicPortHelp),
+    ['/runtime/dsh.js', 'web', '--no-open', '--port', '0'],
+  )
+})
+
+test('reports stderr startup failures and removes secrets from the user-visible diagnostics', () => {
+  assert.equal(
+    sanitizeRuntimeOutput('open http://127.0.0.1:1234/?token=secret-value\nAuthorization: Bearer abc123'),
+    'open http://127.0.0.1:1234/?token=[已隐藏]\nAuthorization: Bearer [已隐藏]',
+  )
+  const error = runtimeStartupError(1, '', 'profile failed for ?api_key=private')
+  assert.equal(error.stage, 'start')
+  assert.equal(error.exitCode, 1)
+  assert.match(error.message, /错误输出：/)
+  assert.match(error.message, /api_key=\[已隐藏\]/)
+  assert.doesNotMatch(error.message, /private/)
+})
+
+test('quarantines only the generated shared profile fallback and preserves user profile data', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-profile-fallback-'))
+  const harnessHome = join(root, 'harness-home')
+  const fallback = join(harnessHome, 'profiles', 'node_modules')
+  const profile = join(harnessHome, 'profiles', 'web')
+  try {
+    await mkdir(join(fallback, '@deepseek-ai', 'dsh-web-app'), { recursive: true })
+    await mkdir(profile, { recursive: true })
+    await writeFile(join(fallback, '@deepseek-ai', 'dsh-web-app', 'package.json'), '{"version":"old"}')
+    await writeFile(join(profile, 'cordis.patch.yml'), 'user-owned: true\n')
+    const destination = await quarantineProfileModuleFallback(
+      harnessHome,
+      join(root, 'backups'),
+      '0.1.2-alpha.2',
+      123,
+    )
+    assert.equal(destination, join(root, 'backups', '123-0.1.2-alpha.2-profile-module-fallback'))
+    assert.equal(await readFile(join(destination, '@deepseek-ai', 'dsh-web-app', 'package.json'), 'utf8'), '{"version":"old"}')
+    assert.deepEqual(await readdir(fallback), [])
+    assert.equal(await readFile(join(profile, 'cordis.patch.yml'), 'utf8'), 'user-owned: true\n')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('rebuilds the generated fallback once after an update startup failure', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-runtime-retry-'))
+  const runtime = new RuntimeManager({ root, nodeBinary: 'node', npmBinary: 'npm', platform: 'darwin' })
+  const fallbackMarker = join(runtime.harnessHome, 'profiles', 'node_modules', 'legacy', 'package.json')
+  const settings = join(runtime.harnessHome, 'settings.yaml')
+  let starts = 0
+  let activated
+  try {
+    await mkdir(join(root, 'versions'), { recursive: true })
+    await writeFile(runtime.statePath, JSON.stringify({ version: '0.1.1-rc.2' }))
+    await mkdir(join(fallbackMarker, '..'), { recursive: true })
+    await writeFile(fallbackMarker, '{"version":"old"}')
+    await writeFile(settings, 'provider: user-owned\n')
+    runtime.install = async () => {}
+    runtime.start = async version => {
+      starts += 1
+      if (starts === 1) throw runtimeStartupError(1, '', 'incompatible generated fallback')
+      assert.equal(version, '0.1.2-alpha.2')
+      return 'http://127.0.0.1:1234/'
+    }
+    runtime.activate = async (version, history) => { activated = { version, history } }
+
+    const result = await runtime.updateAndRestart('0.1.2-alpha.2')
+    assert.equal(starts, 2)
+    assert.equal(result.url, 'http://127.0.0.1:1234/')
+    assert.equal(activated.version, '0.1.2-alpha.2')
+    assert.equal(await readFile(settings, 'utf8'), 'provider: user-owned\n')
+    assert.deepEqual(await readdir(join(runtime.harnessHome, 'profiles', 'node_modules')), [])
+    assert.equal(await readFile(join(result.recoveryPath, 'legacy', 'package.json'), 'utf8'), '{"version":"old"}')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('restores the complete previous home when the compatibility retry still fails', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-runtime-retry-rollback-'))
+  const runtime = new RuntimeManager({ root, nodeBinary: 'node', npmBinary: 'npm', platform: 'darwin' })
+  const fallbackMarker = join(runtime.harnessHome, 'profiles', 'node_modules', 'legacy', 'package.json')
+  const settings = join(runtime.harnessHome, 'settings.yaml')
+  const starts = []
+  try {
+    await mkdir(join(root, 'versions'), { recursive: true })
+    await writeFile(runtime.statePath, JSON.stringify({ version: '0.1.1-rc.2' }))
+    await mkdir(join(fallbackMarker, '..'), { recursive: true })
+    await writeFile(fallbackMarker, '{"version":"old"}')
+    await writeFile(settings, 'provider: user-owned\n')
+    runtime.install = async () => {}
+    runtime.start = async version => {
+      starts.push(version)
+      if (version === '0.1.2-alpha.2') throw runtimeStartupError(1, '', 'still incompatible')
+      return 'http://127.0.0.1:4321/'
+    }
+
+    await assert.rejects(runtime.updateAndRestart('0.1.2-alpha.2'), /still incompatible/)
+    assert.deepEqual(starts, ['0.1.2-alpha.2', '0.1.2-alpha.2', '0.1.1-rc.2'])
+    assert.equal(await readFile(settings, 'utf8'), 'provider: user-owned\n')
+    assert.equal(await readFile(fallbackMarker, 'utf8'), '{"version":"old"}')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
 })
 
 test('tries the system proxy and retains a direct-download fallback', () => {
