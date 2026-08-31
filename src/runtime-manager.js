@@ -1,4 +1,6 @@
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { createReadStream } from 'node:fs'
 import { createServer } from 'node:net'
 import { access, cp, lstat, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
@@ -45,6 +47,48 @@ export function assertSafeVersion(version) {
     throw new Error(`Invalid Harness version: ${JSON.stringify(version)}`)
   }
   return version
+}
+
+/** Compare SemVer-compatible Harness versions without depending on npm's mutable dist-tags. */
+export function compareRuntimeVersions(left, right) {
+  const parse = value => {
+    const safe = assertSafeVersion(value)
+    const match = safe.match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/)
+    if (match === null) throw new Error(`Unsupported Harness version: ${safe}`)
+    return {
+      core: match.slice(1, 4).map(Number),
+      prerelease: match[4]?.split('.'),
+    }
+  }
+  const leftVersion = parse(left)
+  const rightVersion = parse(right)
+  for (let index = 0; index < leftVersion.core.length; index += 1) {
+    if (leftVersion.core[index] !== rightVersion.core[index]) {
+      return leftVersion.core[index] > rightVersion.core[index] ? 1 : -1
+    }
+  }
+  if (leftVersion.prerelease === undefined || rightVersion.prerelease === undefined) {
+    if (leftVersion.prerelease === rightVersion.prerelease) return 0
+    return leftVersion.prerelease === undefined ? 1 : -1
+  }
+  const length = Math.max(leftVersion.prerelease.length, rightVersion.prerelease.length)
+  for (let index = 0; index < length; index += 1) {
+    const leftIdentifier = leftVersion.prerelease[index]
+    const rightIdentifier = rightVersion.prerelease[index]
+    if (leftIdentifier === rightIdentifier) continue
+    if (leftIdentifier === undefined) return -1
+    if (rightIdentifier === undefined) return 1
+    const leftNumeric = /^\d+$/.test(leftIdentifier)
+    const rightNumeric = /^\d+$/.test(rightIdentifier)
+    if (leftNumeric && rightNumeric) {
+      const difference = Number(leftIdentifier) - Number(rightIdentifier)
+      if (difference !== 0) return difference > 0 ? 1 : -1
+      continue
+    }
+    if (leftNumeric !== rightNumeric) return leftNumeric ? -1 : 1
+    return leftIdentifier > rightIdentifier ? 1 : -1
+  }
+  return 0
 }
 
 /** Extract the loopback URL printed by `dsh web`. */
@@ -286,7 +330,7 @@ export async function removeRuntimePath(path, {
   }
 }
 
-const REQUIRED_WEB_CAPABILITIES = [
+export const REQUIRED_WEB_CAPABILITIES = [
   'code-runtime',
   'goal',
   'llm-deepseek',
@@ -306,7 +350,7 @@ const REQUIRED_WEB_CAPABILITIES = [
   'web-runtime',
 ]
 
-const REQUIRED_RUNTIME_PACKAGES = [
+export const REQUIRED_RUNTIME_PACKAGES = [
   'dsh-headless',
   'dsh-mcp-client',
   'dsh-pwsh-local',
@@ -431,6 +475,12 @@ function stageError(stage, message, cause, details = {}) {
   return error
 }
 
+async function sha256File(file) {
+  const hash = createHash('sha256')
+  for await (const chunk of createReadStream(file)) hash.update(chunk)
+  return hash.digest('hex')
+}
+
 export class RuntimeManager {
   constructor({
     root,
@@ -443,6 +493,7 @@ export class RuntimeManager {
     systemFetch,
     directFetch,
     onProgress,
+    bundledRuntime,
     platform = process.platform,
     logger = console,
   }) {
@@ -456,6 +507,17 @@ export class RuntimeManager {
     this.systemFetch = systemFetch
     this.directFetch = directFetch ?? fetch
     this.onProgress = onProgress
+    this.bundledRuntime = bundledRuntime === undefined ? undefined : {
+      version: assertSafeVersion(bundledRuntime.version),
+      archive: bundledRuntime.archive,
+      sha256: bundledRuntime.sha256,
+    }
+    if (this.bundledRuntime !== undefined && (typeof this.bundledRuntime.archive !== 'string' || this.bundledRuntime.archive === '')) {
+      throw new Error('Bundled Harness Runtime archive is not configured')
+    }
+    if (this.bundledRuntime !== undefined && !/^[a-f0-9]{64}$/.test(this.bundledRuntime.sha256 ?? '')) {
+      throw new Error('Bundled Harness Runtime archive SHA-256 is invalid')
+    }
     this.platform = platform
     this.logger = logger
     this.process = undefined
@@ -603,10 +665,72 @@ export class RuntimeManager {
     }
   }
 
+  async installBundledRuntime(version, target) {
+    const safeVersion = assertSafeVersion(version)
+    if (this.bundledRuntime?.version !== safeVersion) return undefined
+    const source = this.bundledRuntime.archive
+    const installDirectory = `${target}.bundled-${Date.now()}`
+    const verificationHome = join(installDirectory, '.verification-home')
+    this.reportProgress({
+      phase: 'install',
+      title: `正在安装内置 Harness ${safeVersion}`,
+      message: '无需下载，正在解压桌面安装包内的完整 Runtime',
+      indeterminate: true,
+    })
+    try {
+      const archiveHash = await sha256File(source)
+      if (archiveHash !== this.bundledRuntime.sha256) {
+        throw new Error(`Bundled Runtime archive SHA-256 mismatch: ${archiveHash}`)
+      }
+      await removeRuntimePath(installDirectory, { platform: this.platform, logger: this.logger })
+      await mkdir(installDirectory, { recursive: true })
+      await run('/usr/bin/tar', ['-xzf', source, '-C', installDirectory], {
+        timeout: RUNTIME_INSTALL_TIMEOUT_MS,
+      })
+      const sourcePackage = JSON.parse(await readFile(join(installDirectory, 'node_modules', '@deepseek-ai', 'dsh', 'package.json'), 'utf8'))
+      if (sourcePackage.version !== safeVersion) {
+        throw new Error(`Bundled Harness reported ${sourcePackage.version}, expected ${safeVersion}`)
+      }
+      await assertRuntimePackages(installDirectory)
+      const entry = join(installDirectory, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+      const environment = this.runtimeEnvironment({ harnessHome: verificationHome, runtimeDirectory: installDirectory })
+      const versionCheck = await run(this.nodeBinary, this.runtimeNodeArgs([entry, '--version']), {
+        cwd: installDirectory,
+        env: environment,
+      })
+      if (versionCheck.stdout.trim() !== safeVersion) {
+        throw new Error(`Bundled Harness reported ${versionCheck.stdout.trim()}, expected ${safeVersion}`)
+      }
+      const configVerification = await run(this.nodeBinary, this.runtimeNodeArgs([entry, 'web', '--dump-default-config']), {
+        cwd: installDirectory,
+        env: environment,
+      })
+      assertRuntimeCapabilities(configVerification.stdout)
+      await removeRuntimePath(verificationHome, {
+        platform: this.platform,
+        required: false,
+        logger: this.logger,
+      })
+      await removeRuntimePath(target, { platform: this.platform, logger: this.logger })
+      await rename(installDirectory, target)
+      return target
+    } catch (error) {
+      await removeRuntimePath(installDirectory, {
+        platform: this.platform,
+        required: false,
+        logger: this.logger,
+      })
+      if (error?.stage) throw error
+      throw stageError('verify', `内置 Harness ${safeVersion} 校验或安装失败`, error)
+    }
+  }
+
   async install(version) {
     const safeVersion = assertSafeVersion(version)
     const target = this.runtimeDirectory(safeVersion)
     if (await this.isInstalledRuntimeReady(target, safeVersion)) return target
+    const bundledTarget = await this.installBundledRuntime(safeVersion, target)
+    if (bundledTarget !== undefined) return bundledTarget
 
     const installDirectory = runtimeInstallDirectory(target, this.platform)
     const proxyResolution = await this.resolveProxy?.(RUNTIME_REGISTRY_URL).catch(error => {

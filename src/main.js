@@ -2,6 +2,7 @@ import { app, BrowserWindow, dialog, ipcMain, session, shell } from 'electron'
 import { access } from 'node:fs/promises'
 import { join } from 'node:path'
 import { RuntimeManager } from './runtime-manager.js'
+import { bundledRuntimeStartupAction, loadBundledRuntime } from './bundled-runtime.js'
 import { DesktopUpdateManager } from './desktop-update-manager.js'
 import { buildRuntimeUpdateDialogHtml, runtimeUpdateDialogAction } from './runtime-update-dialog.js'
 import { installApplicationMenu } from './menu.js'
@@ -38,6 +39,12 @@ function resolveRuntimePreload() {
   if (process.platform !== 'win32') return undefined
   if (app.isPackaged) return join(process.resourcesPath, 'runtime-support', 'windows-runtime-fs-shim.cjs')
   return join(import.meta.dirname, 'windows-runtime-fs-shim.cjs')
+}
+
+async function resolveBundledRuntime() {
+  const manifestPath = process.env.DSH_DESKTOP_BUNDLED_RUNTIME_MANIFEST
+    || (app.isPackaged && process.platform === 'darwin' ? join(process.resourcesPath, 'bundled-runtime.json') : undefined)
+  return manifestPath === undefined ? undefined : loadBundledRuntime(manifestPath)
 }
 
 function createWindow() {
@@ -338,6 +345,7 @@ async function boot() {
   mainWindow = createWindow()
   await showSplash('正在准备 DeepSeek Harness Runtime…')
 
+  const bundledRuntime = await resolveBundledRuntime()
   runtime = new RuntimeManager({
     root: process.env.DSH_DESKTOP_RUNTIME_ROOT || defaultRuntimeRoot({
       platform: process.platform,
@@ -355,6 +363,7 @@ async function boot() {
       if (mainWindow === undefined || mainWindow.isDestroyed()) return
       mainWindow.webContents.send('desktop-harness:update-progress', progress)
     },
+    bundledRuntime,
   })
   desktopUpdater = new DesktopUpdateManager({
     updater: autoUpdater,
@@ -375,13 +384,49 @@ async function boot() {
   })
 
   let version = await runtime.getActiveVersion()
-  if (version === undefined) {
-    version = await runtime.getLatestVersion()
-    await showSplash(`首次安装 Harness ${version}，可能需要几分钟…`)
+  const activeVersionBeforeBundledUpgrade = version
+  const startupAction = bundledRuntimeStartupAction(version, bundledRuntime?.version)
+  let url
+  let bundledUpgradeError
+  if (startupAction.action === 'fresh-install') {
+    version = startupAction.version
+    await showSplash(`正在安装内置 Harness ${version}，无需联网下载…`)
     await runtime.activate(version)
+    url = await runtime.start(version)
+  } else if (startupAction.action === 'upgrade') {
+    version = startupAction.version
+    await showSplash(`正在启用桌面安装包内置的 Harness ${version}…`)
+    try {
+      const installed = await runtime.updateAndRestart(version)
+      url = installed.url
+    } catch (error) {
+      if (runtime.currentUrl === undefined || activeVersionBeforeBundledUpgrade === undefined) throw error
+      bundledUpgradeError = error
+      version = activeVersionBeforeBundledUpgrade
+      url = runtime.currentUrl
+    }
+  } else {
+    version = startupAction.version
+    if (version === undefined) {
+      version = await runtime.getLatestVersion()
+      await showSplash(`首次安装 Harness ${version}，可能需要几分钟…`)
+      await runtime.activate(version)
+    } else if (startupAction.action === 'ensure-installed') {
+      await showSplash(`正在校验内置 Harness ${version}…`)
+      await runtime.install(version)
+    }
+    url = await runtime.start(version)
   }
-  const url = await runtime.start(version)
   await mainWindow.loadURL(url)
+  if (bundledUpgradeError !== undefined) {
+    await dialog.showMessageBox(mainWindow, {
+      type: 'warning',
+      title: '已恢复原 Harness Runtime',
+      message: '安装包内置 Runtime 未能启动，已继续使用原来的可用版本。',
+      detail: formatUpdateFailure(bundledUpgradeError, bundledRuntime?.version),
+      buttons: ['继续使用'],
+    })
+  }
   setTimeout(() => { void checkForUpdates({ interactive: false }) }, 10_000)
   setTimeout(() => { void desktopUpdater.check() }, 20_000)
 }

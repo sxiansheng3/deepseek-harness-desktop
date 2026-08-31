@@ -8,6 +8,7 @@ DeepSeek Harness Desktop is an Electron shell around the official, open-source D
 - Loads the existing Harness React UI in a hardened Electron window.
 - Stores Harness state under the Electron user-data directory on macOS. Windows keeps downloaded Runtime data under `%LOCALAPPDATA%` so large packages and module mappings do not depend on a roaming profile.
 - Follows every published official GitHub Release, including releases marked as Pre-release, and offers a one-click Runtime update.
+- Ships the complete current macOS arm64 Harness Runtime inside the signed desktop application. A clean installation copies and verifies that bundled Runtime locally, so first launch does not depend on npm or GitHub being reachable.
 - Confirms the matching official npm package exists before offering installation, then shows the GitHub Release notes and source link.
 - Shows the Chinese section of bilingual Runtime release notes in a fixed-height, scrollable dialog whose close and update controls remain visible.
 - Resolves the operating system proxy through Electron, retries network failures through a direct connection, and never changes system proxy settings.
@@ -17,6 +18,7 @@ DeepSeek Harness Desktop is an Electron shell around the official, open-source D
 - Shows desktop-shell release notes before downloading, then reports exact percentage, transferred bytes, total bytes, download speed, and the active system-proxy/direct route.
 - Retries desktop-shell network failures through a direct connection without changing the operating system's proxy configuration.
 - Installs updates beside the active version, switches only after a successful start, and restarts the previous version after a failed start.
+- When a newer desktop build carries a newer bundled Runtime, upgrades an existing older Runtime from the local application resources before starting. A later user-installed Runtime is never downgraded.
 - Snapshots the Harness home before an update and exposes a one-click rollback that restores both the prior Runtime and its compatible data.
 - Verifies the official Web profile still contains the model, MCP, plan, persistence, Skill, subagent, terminal, filesystem, web, workflow, and UI capabilities before accepting an update.
 - Stops the Runtime when the desktop application quits.
@@ -60,7 +62,7 @@ DSH_DESKTOP_RUNTIME_ROOT="$PWD/runtime-data" npm start
 
 Harness updates and desktop-shell updates are intentionally separate.
 
-1. **Harness Runtime update:** the application reads the newest entry from the official GitHub Releases feed, including Pre-releases, confirms that exact `@deepseek-ai/dsh` version exists in the npm registry, installs it under `runtime/versions/<version>`, verifies `dsh --version`, starts it, then atomically records it as active. If the GitHub Release has no matching npm package yet, the application reports that it is published but not installable. If startup fails, the previous active version is restarted.
+1. **Harness Runtime update:** the signed macOS application carries the complete Runtime version recorded in `resources/bundled-runtime.json`. Fresh installs copy and verify it locally without npm or GitHub access; upgrades prefer it when it is newer than the active Runtime and never downgrade a later user-installed version. After installation, the application still reads the newest entry from the official GitHub Releases feed, including Pre-releases, confirms that exact `@deepseek-ai/dsh` version exists in the npm registry, installs later releases under `runtime/versions/<version>`, verifies `dsh --version`, starts them, then atomically records them as active. If a GitHub Release has no matching npm package yet, the application reports that it is published but not installable. If startup fails, the previous active version is restarted.
 2. **Desktop application update:** required only when Electron integration or desktop UI changes. Packaged builds check the public `sxiansheng3/deepseek-harness-desktop` GitHub release channel. If a newer signed build exists, the local Harness page shows a compact badge; clicking it displays the release notes and downloads through the system network route with a direct fallback. Equal or older releases produce no badge.
 
 The packaged application ships pinned Node, npm, and pnpm tools. npm owns Runtime installation on all platforms. pnpm remains available for the official `dsh plugin` command, with its Windows global virtual store disabled and a hoisted linker selected. Development overrides are available through `DSH_DESKTOP_NODE_BINARY`, `DSH_DESKTOP_NPM_BINARY`, and `DSH_DESKTOP_PNPM_BINARY`.

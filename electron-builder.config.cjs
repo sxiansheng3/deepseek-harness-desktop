@@ -1,5 +1,6 @@
 const path = require('node:path')
 const notarizationEnabled = Boolean(process.env.APPLE_KEYCHAIN_PROFILE?.trim())
+const bundledRuntime = require('./resources/bundled-runtime.json')
 
 module.exports = {
   appId: 'com.songtao.deepseek-harness-desktop',
@@ -35,6 +36,8 @@ module.exports = {
     ],
     extraResources: [
       { from: 'vendor/node', to: 'node' },
+      { from: 'resources/bundled-runtime.json', to: 'bundled-runtime.json' },
+      { from: `vendor/runtime/${bundledRuntime.version}.tar.gz`, to: `bundled-runtime/${bundledRuntime.version}.tar.gz` },
     ],
   },
   win: {
