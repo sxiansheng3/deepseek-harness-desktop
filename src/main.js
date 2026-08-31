@@ -3,6 +3,7 @@ import { access } from 'node:fs/promises'
 import { join } from 'node:path'
 import { RuntimeManager } from './runtime-manager.js'
 import { DesktopUpdateManager } from './desktop-update-manager.js'
+import { buildRuntimeUpdateDialogHtml, runtimeUpdateDialogAction } from './runtime-update-dialog.js'
 import { installApplicationMenu } from './menu.js'
 import { bundledToolDirectory, bundledToolPath } from './tool-layout.js'
 import electronUpdater from 'electron-updater'
@@ -149,6 +150,69 @@ function formatUpdateFailure(error, version) {
   return lines.join('\n').slice(0, 16_000)
 }
 
+async function showRuntimeUpdateDialog(update) {
+  const parentBounds = mainWindow.getContentBounds()
+  const width = Math.min(680, Math.max(520, parentBounds.width - 80))
+  const height = Math.min(720, Math.max(480, parentBounds.height - 80))
+  const updateWindow = new BrowserWindow({
+    parent: mainWindow,
+    modal: true,
+    width,
+    height,
+    useContentSize: true,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    frame: false,
+    show: false,
+    backgroundColor: '#f8fafc',
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  })
+  updateWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+
+  return await new Promise((resolve, reject) => {
+    let settled = false
+    const finish = action => {
+      if (settled) return
+      settled = true
+      resolve(action)
+      if (!updateWindow.isDestroyed()) updateWindow.close()
+    }
+    const fail = error => {
+      if (settled) return
+      settled = true
+      reject(error)
+      if (!updateWindow.isDestroyed()) updateWindow.close()
+    }
+
+    updateWindow.webContents.on('before-input-event', (event, input) => {
+      if (input.type === 'keyDown' && input.key === 'Escape') {
+        event.preventDefault()
+        finish('cancel')
+      }
+    })
+    updateWindow.webContents.on('will-navigate', (event, url) => {
+      const action = runtimeUpdateDialogAction(url)
+      if (action === undefined) return
+      event.preventDefault()
+      if (action === 'github') {
+        if (update.releaseNotes?.url) void shell.openExternal(update.releaseNotes.url)
+        return
+      }
+      finish(action)
+    })
+    updateWindow.once('ready-to-show', () => updateWindow.show())
+    updateWindow.once('closed', () => finish('cancel'))
+    const html = buildRuntimeUpdateDialogHtml(update)
+    updateWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`).catch(fail)
+  })
+}
+
 async function startDesktopApplicationUpdate() {
   const status = desktopUpdater.getStatus()
   if (!status.available || !status.update?.version) return
@@ -212,27 +276,8 @@ async function checkForUpdates({ interactive = true } = {}) {
       }
       return
     }
-    const releaseNotes = update.releaseNotes?.body?.trim()
-    const result = await dialog.showMessageBox(mainWindow, {
-      type: 'info',
-      title: '发现 Harness 更新',
-      message: `发现新版本 ${update.version}`,
-      detail: `${update.activeVersion === undefined
-        ? '安装后即可开始使用。'
-        : `当前版本 ${update.activeVersion}。更新失败时会自动恢复旧版本。`}${releaseNotes ? `\n\n官方 GitHub 更新说明：\n${releaseNotes.slice(0, 6_000)}` : ''}`,
-      buttons: [
-        '更新并重启 Harness',
-        '暂不更新',
-        ...(update.releaseNotes?.url ? ['在 GitHub 查看'] : []),
-      ],
-      defaultId: 0,
-      cancelId: 1,
-    })
-    if (result.response === 2 && update.releaseNotes?.url) {
-      await shell.openExternal(update.releaseNotes.url)
-      return
-    }
-    if (result.response !== 0) return
+    const action = await showRuntimeUpdateDialog(update)
+    if (action !== 'update') return
     await showUpdateProgress(update.version)
     const installed = await runtime.updateAndRestart(update.version)
     await mainWindow.loadURL(installed.url)

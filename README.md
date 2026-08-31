@@ -9,6 +9,7 @@ DeepSeek Harness Desktop is an Electron shell around the official, open-source D
 - Stores Harness state under the Electron user-data directory on macOS. Windows keeps downloaded Runtime data under `%LOCALAPPDATA%` so large packages and module mappings do not depend on a roaming profile.
 - Follows every published official GitHub Release, including releases marked as Pre-release, and offers a one-click Runtime update.
 - Confirms the matching official npm package exists before offering installation, then shows the GitHub Release notes and source link.
+- Shows the Chinese section of bilingual Runtime release notes in a fixed-height, scrollable dialog whose close and update controls remain visible.
 - Resolves the operating system proxy through Electron, retries network failures through a direct connection, and never changes system proxy settings.
 - Shows a dedicated update screen with the active network route, elapsed work, processed data, and an estimated download/extraction write rate.
 - Allows a Runtime installation to run for up to 100 minutes and reports the exact failed stage, attempted network routes, and underlying package-manager error.
