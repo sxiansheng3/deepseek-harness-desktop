@@ -174,7 +174,7 @@ async function renderDesktopSettings(dialog, desktopButton) {
         </div>
         <div class="dsh-desktop-label">原生优先 · 自动回退</div>
       </div>
-      <div class="dsh-desktop-status">只对真实成功读取过图片的精确模型启用图片声明；Harness 更新不会被阻止。</div>
+      <div class="dsh-desktop-status">兼容优先：模型未明确声明能力时允许尝试图片；明确的纯文本声明仍会保留。Harness 更新后会自动重新应用。</div>
     </div>
   `
   options.appendChild(panel)

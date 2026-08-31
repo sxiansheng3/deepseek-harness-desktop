@@ -19,7 +19,11 @@ const SETTINGS = `llm-pi-ai:
       baseURL: https://gateway.example/v1
       models:
         - id: text-only
+          input:
+            - text
         - id: vision-model
+          input:
+            - text
 agent-default-model:
   provider: youkede
   model: vision-model
@@ -86,7 +90,7 @@ test('a real successful image call remembers and patches only the exact model', 
     assert.equal(body.model, 'vision-model')
     assert.match(body.messages[0].content[1].image_url.url, /^data:image\/png;base64,/)
     const settings = parse(await readFile(join(context.harnessHome, 'settings.yaml'), 'utf8'))
-    assert.deepEqual(settings['llm-pi-ai'].providers.youkede.models[0], { id: 'text-only' })
+    assert.deepEqual(settings['llm-pi-ai'].providers.youkede.models[0], { id: 'text-only', input: ['text'] })
     assert.deepEqual(settings['llm-pi-ai'].providers.youkede.models[1], { id: 'vision-model', input: ['text', 'image'] })
     assert.equal(context.manager.publicStatus().models[0].model, 'vision-model')
 
@@ -97,6 +101,80 @@ test('a real successful image call remembers and patches only the exact model', 
   } finally {
     context.manager.dispose()
     await rm(context.root, { recursive: true, force: true })
+  }
+})
+
+test('unknown OpenAI-compatible models optimistically allow images without overriding explicit text-only models', async () => {
+  const context = await fixture(async () => new Response('{}', { status: 500 }))
+  try {
+    const unknownSettings = `llm-pi-ai:
+  providers:
+    youkede:
+      api: openai-completions
+      models:
+        - id: claude-opus-4-8
+        - id: future-vision-model
+        - id: explicitly-text-only
+          input:
+            - text
+    native-provider:
+      api: anthropic-messages
+      models:
+        - id: untouched-model
+`
+    await writeFile(join(context.harnessHome, 'settings.yaml'), unknownSettings)
+    assert.equal(await context.manager.applyOptimisticImageDeclarations(), true)
+    assert.equal(await context.manager.applyOptimisticImageDeclarations(), false)
+    const settings = parse(await readFile(join(context.harnessHome, 'settings.yaml'), 'utf8'))
+    const youkede = settings['llm-pi-ai'].providers.youkede.models
+    assert.deepEqual(youkede[0], { id: 'claude-opus-4-8', input: ['text', 'image'] })
+    assert.deepEqual(youkede[1], { id: 'future-vision-model', input: ['text', 'image'] })
+    assert.deepEqual(youkede[2], { id: 'explicitly-text-only', input: ['text'] })
+    assert.deepEqual(settings['llm-pi-ai'].providers['native-provider'].models[0], { id: 'untouched-model' })
+
+    await writeFile(join(context.harnessHome, 'settings.yaml'), unknownSettings)
+    assert.equal(await context.manager.applyOptimisticImageDeclarations(), true)
+    const restored = parse(await readFile(join(context.harnessHome, 'settings.yaml'), 'utf8'))
+    assert.deepEqual(restored['llm-pi-ai'].providers.youkede.models[0].input, ['text', 'image'])
+  } finally {
+    context.manager.dispose()
+    await rm(context.root, { recursive: true, force: true })
+  }
+})
+
+test('clean install waits for Runtime settings and applies the image policy when the file appears', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-vision-clean-install-'))
+  const harnessHome = join(root, 'harness-home')
+  await mkdir(harnessHome)
+  const manager = new VisionCompatibilityManager({
+    root,
+    harnessHome,
+    fetchImpl: async () => new Response('{}', { status: 500 }),
+    logger: { warn() {} },
+  })
+  try {
+    await manager.initialize()
+    assert.equal(await manager.applyOptimisticImageDeclarations(), false)
+    await writeFile(join(harnessHome, 'settings.yaml'), `llm-pi-ai:
+  providers:
+    youkede:
+      api: openai-completions
+      models:
+        - id: claude-opus-4-8
+`)
+
+    const deadline = Date.now() + 2_000
+    let input
+    while (Date.now() < deadline) {
+      const settings = parse(await readFile(join(harnessHome, 'settings.yaml'), 'utf8'))
+      input = settings?.['llm-pi-ai']?.providers?.youkede?.models?.[0]?.input
+      if (Array.isArray(input)) break
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+    assert.deepEqual(input, ['text', 'image'])
+  } finally {
+    manager.dispose()
+    await rm(root, { recursive: true, force: true })
   }
 })
 

@@ -27,8 +27,8 @@ DeepSeek Harness Desktop is an Electron shell around the official, open-source D
 - If a macOS/Linux update finds an incompatible shared module fallback from an older Runtime, moves only that generated fallback into the recoverable update backups, regenerates it, and retries startup once. Sessions, settings, credentials, profile patches, and profile-local plugins are left unchanged.
 - Captures sanitized startup stdout and stderr so a failed update reports the actual upstream startup error without exposing one-time tokens or credentials.
 - Preserves the official one-time local launch token introduced by newer Harness Runtimes while continuing to reject non-loopback startup URLs.
-- Verifies image capability against the exact configured provider/model route, then persists only models that have successfully read a real image; provider-wide guessing is never used.
-- Prefers the official Harness image path, automatically bridges the first undeclared image request through that same model, and restores verified declarations after independent Harness Runtime updates without blocking those updates.
+- Respects exact provider/model image declarations and explicit text-only declarations. For OpenAI-compatible routes whose metadata omits input modalities, it permits a real image request instead of falsely rejecting the model before the provider sees it.
+- Prefers the official Harness image path, keeps the same selected model for compatibility fallback, and reapplies compatible or verified declarations after independent Harness Runtime updates without blocking those updates.
 - Prevents native attachments from being re-read through image tools and handles provider-specific thinking controls so ordinary image answers do not expose internal reasoning or duplicate tool workflows.
 - Converts GitHub's HTML desktop release notes into readable plain text before showing the native update confirmation dialog.
 - Replaces raw Runtime and MCP startup stacks with a concise actionable error while retaining a redacted local diagnostic log.

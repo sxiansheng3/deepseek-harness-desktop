@@ -11,6 +11,7 @@ const IMAGE_READER_ORIGINAL_DESCRIPTION = 'Local MCP tools to read and visualize
 const IMAGE_READER_SAFE_DESCRIPTION = 'Local MCP tools for explicit local file paths, unsupported document/media formats, cropping, annotation, and frame extraction. Do not invoke for an image already attached to a natively visual model.'
 const IMAGE_READER_GUARD = '<!-- dsh-desktop-native-vision-guard-v1 -->'
 const GLOBAL_VISION_GUARD = '<!-- dsh-desktop-native-vision-instructions-v1 -->'
+const OPTIMISTIC_IMAGE_APIS = new Set(['openai-completions'])
 const GLOBAL_VISION_INSTRUCTIONS = `${GLOBAL_VISION_GUARD}
 
 # DeepSeek Harness Desktop native vision
@@ -119,6 +120,7 @@ export class VisionCompatibilityManager {
     } catch (error) {
       if (error?.code !== 'ENOENT') this.logger.warn(`Unable to read vision capability registry: ${safeMessage(error)}`)
     }
+    await this.applyOptimisticImageDeclarations()
     await this.reapplyVerifiedModels()
     await this.harmonizeImageReaderSkill()
     await this.harmonizeGlobalInstructions()
@@ -142,7 +144,10 @@ export class VisionCompatibilityManager {
           if (this.reapplyTimer !== undefined) clearTimeout(this.reapplyTimer)
           this.reapplyTimer = setTimeout(() => {
             this.reapplyTimer = undefined
-            void this.reapplyVerifiedModels().catch(error => {
+            void (async () => {
+              await this.applyOptimisticImageDeclarations()
+              await this.reapplyVerifiedModels()
+            })().catch(error => {
               this.logger.warn(`Unable to restore vision declarations: ${safeMessage(error)}`)
             })
             void this.harmonizeImageReaderSkill().catch(error => {
@@ -164,7 +169,11 @@ export class VisionCompatibilityManager {
       .filter(entry => entry?.verified === true)
       .map(({ provider, model, verifiedAt, source }) => ({ provider, model, verifiedAt, source }))
       .sort((left, right) => `${left.provider}/${left.model}`.localeCompare(`${right.provider}/${right.model}`))
-    return { mode: models.length > 0 ? 'native-with-fallback' : 'automatic-fallback', models }
+    return {
+      mode: 'optimistic-native-with-fallback',
+      policy: 'Models without an explicit input declaration are allowed to try images; explicit text-only declarations remain unchanged.',
+      models,
+    }
   }
 
   isVerified(provider, model) {
@@ -189,6 +198,47 @@ export class VisionCompatibilityManager {
   async routeDeclaresImage(provider, model) {
     const route = await this.resolveRoute(provider, model)
     return route !== undefined && modelInputHasImage(route.entry)
+  }
+
+  async applyOptimisticImageDeclarations() {
+    let source
+    try {
+      source = await readFile(this.settingsPath, 'utf8')
+    } catch (error) {
+      // On a clean desktop install the Runtime creates settings.yaml during its
+      // first start. Initialization must not fail while that file is still
+      // absent; the directory watcher will apply the policy once it appears.
+      if (error?.code === 'ENOENT') return false
+      throw error
+    }
+    const document = parseDocument(source)
+    const providers = document.getIn(['llm-pi-ai', 'providers'], true)
+    if (!providers?.items) return false
+
+    let changed = false
+    for (const pair of providers.items) {
+      const profile = pair?.value
+      if (!profile?.get || !OPTIMISTIC_IMAGE_APIS.has(plainYamlValue(profile.get('api')))) continue
+      const models = profile.get('models', true)
+      if (!models?.items) continue
+      for (const item of models.items) {
+        if (!item?.get || typeof plainYamlValue(item.get('id')) !== 'string') continue
+        // Harness treats an omitted input declaration as text-only. For an
+        // OpenAI-compatible gateway that produces false negatives because the
+        // gateway, not its model catalogue, is the source of truth. Preserve
+        // every explicit declaration and only make unknown entries permissive.
+        if (item.get('input', true) !== undefined) continue
+        item.set('input', ['text', 'image'])
+        changed = true
+      }
+    }
+
+    if (!changed) return false
+    const next = `${this.settingsPath}.next-${process.pid}-${randomUUID()}`
+    await mkdir(dirname(this.settingsPath), { recursive: true })
+    await writeFile(next, document.toString(), { mode: 0o600 })
+    await rename(next, this.settingsPath)
+    return true
   }
 
   async readCredential(ref) {
