@@ -16,7 +16,7 @@ The packaged application checks the public GitHub release channel. Equal or olde
 
 ## Harness Runtime
 
-The desktop application reads the official npm `latest` tag for `@deepseek-ai/dsh`. It never uses this repository's desktop release to represent an upstream Harness Runtime version. Runtime release notes are shown only when the official `deepseek-ai/deepseek-harness` GitHub repository has notes for the matching tag.
+The desktop application follows the newest published entry in the official `deepseek-ai/deepseek-harness` GitHub Releases Atom feed, including releases marked as Pre-release. It confirms that the exact version exists as an official `@deepseek-ai/dsh` npm package before offering installation. A source-only GitHub Release is reported as published but not yet installable. The Runtime update uses the same GitHub entry for its release notes and source link; it never uses this repository's desktop release to represent an upstream Harness Runtime version.
 
 ## Credentials and local data
 

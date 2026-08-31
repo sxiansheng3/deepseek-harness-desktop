@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path'
 
 const PACKAGE_NAME = '@deepseek-ai/dsh'
 export const RUNTIME_REGISTRY_URL = 'https://registry.npmjs.org/@deepseek-ai%2fdsh'
-const GITHUB_RELEASE_API = 'https://api.github.com/repos/deepseek-ai/deepseek-harness/releases/tags/'
+export const GITHUB_RELEASES_FEED_URL = 'https://github.com/deepseek-ai/deepseek-harness/releases.atom'
 const STARTUP_TIMEOUT_MS = 120_000
 const COMMAND_TIMEOUT_MS = 120_000
 export const RUNTIME_INSTALL_TIMEOUT_MS = 100 * 60_000
@@ -49,14 +49,88 @@ export function assertSafeVersion(version) {
 
 /** Extract the loopback URL printed by `dsh web`. */
 export function parseRuntimeUrl(output) {
-  const match = output.match(/dsh web:\s+(http:\/\/127\.0\.0\.1:\d+)/)
-  return match?.[1]
+  const match = output.match(/dsh web:\s+(http:\/\/127\.0\.0\.1:\d+(?:\/[^\s()]*)?)/)
+  if (match?.[1] === undefined) return undefined
+  try {
+    const url = new URL(match[1])
+    if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || url.port === '') return undefined
+    return url.href
+  } catch {
+    return undefined
+  }
 }
 
-/** Compare exact npm versions. RC ordering is delegated to the registry's dist-tag. */
-export function describeUpdate(activeVersion, latestVersion) {
-  if (activeVersion === latestVersion) return { available: false, version: latestVersion }
-  return { available: true, version: latestVersion }
+/** Compare exact versions. Release ordering is owned by GitHub's published-release feed. */
+export function describeUpdate(activeVersion, publishedVersion) {
+  if (activeVersion === publishedVersion) return { available: false, version: publishedVersion }
+  return { available: true, version: publishedVersion }
+}
+
+function decodeEntities(value) {
+  const named = { amp: '&', apos: "'", gt: '>', lt: '<', nbsp: ' ', quot: '"' }
+  return value.replace(/&(#(?:x[0-9a-f]+|[0-9]+)|amp|apos|gt|lt|nbsp|quot);/gi, (match, entity) => {
+    if (entity.startsWith('#x') || entity.startsWith('#X')) {
+      return String.fromCodePoint(Number.parseInt(entity.slice(2), 16))
+    }
+    if (entity.startsWith('#')) return String.fromCodePoint(Number.parseInt(entity.slice(1), 10))
+    return named[entity.toLowerCase()] ?? match
+  })
+}
+
+function releaseNotesFromHtml(value) {
+  const html = decodeEntities(value)
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<li(?:\s[^>]*)?>/gi, '- ')
+    .replace(/<\/(?:h[1-6]|li|ol|p|pre|ul)>/gi, '\n')
+    .replace(/<hr(?:\s[^>]*)?\/?>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+  return decodeEntities(html)
+    .replace(/\r/g, '')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
+function atomElement(entry, name) {
+  return entry.match(new RegExp(`<${name}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${name}>`, 'i'))?.[1]
+}
+
+/** Parse the official GitHub Releases feed, including releases marked as Pre-release. */
+export function parseRuntimeReleaseFeed(feed) {
+  if (typeof feed !== 'string') throw new Error('GitHub release feed is not text')
+  return [...feed.matchAll(/<entry>([\s\S]*?)<\/entry>/gi)].flatMap(match => {
+    const entry = match[1]
+    const href = entry.match(/<link\s[^>]*rel=["']alternate["'][^>]*href=["']([^"']+)["'][^>]*\/?\s*>/i)?.[1]
+      ?? entry.match(/<link\s[^>]*href=["']([^"']+)["'][^>]*rel=["']alternate["'][^>]*\/?\s*>/i)?.[1]
+    const tag = href?.match(/\/releases\/tag\/([^/?#]+)/)?.[1]
+      ?? atomElement(entry, 'id')?.match(/\/([^/]+)$/)?.[1]
+    const version = runtimeVersionFromReleaseTag(tag)
+    if (version === undefined) return []
+    const title = decodeEntities(atomElement(entry, 'title') ?? tag ?? version).trim()
+    const body = releaseNotesFromHtml(atomElement(entry, 'content') ?? '')
+    return [{
+      version,
+      title: title || version,
+      body,
+      url: href === undefined ? undefined : decodeEntities(href),
+      publishedAt: decodeEntities(atomElement(entry, 'updated') ?? '').trim() || undefined,
+    }]
+  })
+}
+
+/** Accept the tag forms used by the official repository, including dsh-v prereleases. */
+export function runtimeVersionFromReleaseTag(tag) {
+  if (typeof tag !== 'string') return undefined
+  try {
+    const decoded = decodeEntities(decodeURIComponent(tag)).trim()
+    const version = decoded.startsWith('dsh-v')
+      ? decoded.slice('dsh-v'.length)
+      : decoded.startsWith('v') ? decoded.slice(1) : decoded
+    if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) return undefined
+    return assertSafeVersion(version)
+  } catch {
+    return undefined
+  }
 }
 
 /** Convert Chromium's system-proxy result into npm-compatible connection attempts. */
@@ -385,6 +459,10 @@ export class RuntimeManager {
   }
 
   async getLatestVersion() {
+    return (await this.getLatestRelease()).version
+  }
+
+  async fetchOfficialResource(url, { accept, label, parse }) {
     const attempts = [
       ...(this.systemFetch ? [{ label: '系统网络（含代理）', fetcher: this.systemFetch }] : []),
       { label: '直接连接', fetcher: this.directFetch },
@@ -392,63 +470,62 @@ export class RuntimeManager {
     const attemptFailures = []
     for (const attempt of attempts) {
       try {
-        const response = await attempt.fetcher(RUNTIME_REGISTRY_URL, {
-          headers: { accept: 'application/vnd.npm.install-v1+json' },
+        const response = await attempt.fetcher(url, {
+          headers: {
+            accept,
+            'user-agent': 'DeepSeek-Harness-Desktop',
+          },
           signal: AbortSignal.timeout(15_000),
         })
-        if (!response.ok) throw new Error(`npm registry returned HTTP ${response.status}`)
-        const metadata = await response.json()
-        return assertSafeVersion(metadata['dist-tags']?.latest)
+        if (!response.ok) throw new Error(`${label} returned HTTP ${response.status}`)
+        return await parse(response)
       } catch (error) {
         attemptFailures.push({ label: attempt.label, error })
       }
     }
-    throw stageError('check', '无法从官方 npm Registry 获取最新 Harness 版本', attemptFailures.at(-1)?.error, { attemptFailures })
+    throw stageError('check', `无法读取${label}`, attemptFailures.at(-1)?.error, { attemptFailures })
+  }
+
+  async getLatestRelease() {
+    const [feed, metadata] = await Promise.all([
+      this.fetchOfficialResource(GITHUB_RELEASES_FEED_URL, {
+        accept: 'application/atom+xml',
+        label: 'DeepSeek 官方 GitHub Release',
+        parse: response => response.text(),
+      }),
+      this.fetchOfficialResource(RUNTIME_REGISTRY_URL, {
+        accept: 'application/vnd.npm.install-v1+json',
+        label: 'DeepSeek 官方 npm Registry',
+        parse: response => response.json(),
+      }),
+    ])
+    const release = parseRuntimeReleaseFeed(feed)[0]
+    if (release === undefined) {
+      throw stageError('check', 'DeepSeek 官方 GitHub 尚未发布可识别的 Harness Release')
+    }
+    if (metadata?.versions?.[release.version] === undefined) {
+      throw stageError(
+        'check',
+        `DeepSeek 官方已发布 Harness ${release.version}，但对应 npm 安装包尚未发布，暂时无法安装`,
+      )
+    }
+    return release
   }
 
   async checkForUpdate() {
-    const [activeVersion, latestVersion] = await Promise.all([
+    const [activeVersion, latestRelease] = await Promise.all([
       this.getActiveVersion(),
-      this.getLatestVersion(),
+      this.getLatestRelease(),
     ])
-    const update = { activeVersion, ...describeUpdate(activeVersion, latestVersion) }
-    if (update.available) update.releaseNotes = await this.getReleaseNotes(latestVersion)
-    return update
-  }
-
-  async getReleaseNotes(version) {
-    const safeVersion = assertSafeVersion(version)
-    for (const tag of [safeVersion, `v${safeVersion}`]) {
-      const fetchers = [
-        ...(this.systemFetch ? [this.systemFetch] : []),
-        this.directFetch,
-      ]
-      for (const fetcher of fetchers) {
-        try {
-          const response = await fetcher(`${GITHUB_RELEASE_API}${encodeURIComponent(tag)}`, {
-            headers: {
-              accept: 'application/vnd.github+json',
-              'user-agent': 'DeepSeek-Harness-Desktop',
-              'x-github-api-version': '2022-11-28',
-            },
-            signal: AbortSignal.timeout(15_000),
-          })
-          if (response.status === 404) break
-          if (!response.ok) continue
-          const release = await response.json()
-          const body = typeof release.body === 'string' ? release.body.trim() : ''
-          if (!body) return undefined
-          return {
-            title: typeof release.name === 'string' && release.name.trim() ? release.name.trim() : tag,
-            body,
-            url: typeof release.html_url === 'string' ? release.html_url : undefined,
-          }
-        } catch {
-          // Release notes are optional; try the next network route or tag.
-        }
+    const update = { activeVersion, ...describeUpdate(activeVersion, latestRelease.version) }
+    if (update.available && latestRelease.body) {
+      update.releaseNotes = {
+        title: latestRelease.title,
+        body: latestRelease.body,
+        url: latestRelease.url,
       }
     }
-    return undefined
+    return update
   }
 
   runtimeDirectory(version) {

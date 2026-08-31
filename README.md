@@ -7,8 +7,8 @@ DeepSeek Harness Desktop is an Electron shell around the official, open-source D
 - Starts the official `@deepseek-ai/dsh` Web profile in a loopback-only child process.
 - Loads the existing Harness React UI in a hardened Electron window.
 - Stores Harness state under the Electron user-data directory on macOS. Windows keeps downloaded Runtime data under `%LOCALAPPDATA%` so large packages and module mappings do not depend on a roaming profile.
-- Checks the official npm `latest` dist-tag and offers a one-click Runtime update.
-- Shows official GitHub Release notes before an update when the matching Runtime release has published notes.
+- Follows every published official GitHub Release, including releases marked as Pre-release, and offers a one-click Runtime update.
+- Confirms the matching official npm package exists before offering installation, then shows the GitHub Release notes and source link.
 - Resolves the operating system proxy through Electron, retries network failures through a direct connection, and never changes system proxy settings.
 - Shows a dedicated update screen with the active network route, elapsed work, processed data, and an estimated download/extraction write rate.
 - Allows a Runtime installation to run for up to 100 minutes and reports the exact failed stage, attempted network routes, and underlying package-manager error.
@@ -20,6 +20,7 @@ DeepSeek Harness Desktop is an Electron shell around the official, open-source D
 - Verifies the official Web profile still contains the model, MCP, plan, persistence, Skill, subagent, terminal, filesystem, web, workflow, and UI capabilities before accepting an update.
 - Stops the Runtime when the desktop application quits.
 - Starts newer Harness Web Runtimes with their official `--no-open` switch so the desktop application does not also launch the default browser; older Runtimes are detected and remain compatible.
+- Preserves the official one-time local launch token introduced by newer Harness Runtimes while continuing to reject non-loopback startup URLs.
 - Forces Harness session telemetry to `DISABLED` unless the deployment explicitly overrides it.
 - Uses the DeepSeek fish mark from the official Harness repository. This desktop application is an independent build and must not be represented as an official DeepSeek distribution.
 - Packages separate native Node.js toolchains for Apple Silicon macOS and x64 Windows, while keeping one shared desktop shell and Runtime update flow.
@@ -55,7 +56,7 @@ DSH_DESKTOP_RUNTIME_ROOT="$PWD/runtime-data" npm start
 
 Harness updates and desktop-shell updates are intentionally separate.
 
-1. **Harness Runtime update:** the application reads the official npm `latest` tag, installs that exact version under `runtime/versions/<version>`, verifies `dsh --version`, starts it, then atomically records it as active. If startup fails, the previous active version is restarted.
+1. **Harness Runtime update:** the application reads the newest entry from the official GitHub Releases feed, including Pre-releases, confirms that exact `@deepseek-ai/dsh` version exists in the npm registry, installs it under `runtime/versions/<version>`, verifies `dsh --version`, starts it, then atomically records it as active. If the GitHub Release has no matching npm package yet, the application reports that it is published but not installable. If startup fails, the previous active version is restarted.
 2. **Desktop application update:** required only when Electron integration or desktop UI changes. Packaged builds check the public `sxiansheng3/deepseek-harness-desktop` GitHub release channel. If a newer signed build exists, the local Harness page shows a compact badge; clicking it displays the release notes and downloads through the system network route with a direct fallback. Equal or older releases produce no badge.
 
 The packaged application ships pinned Node, npm, and pnpm tools. npm owns Runtime installation on all platforms. pnpm remains available for the official `dsh plugin` command, with its Windows global virtual store disabled and a hoisted linker selected. Development overrides are available through `DSH_DESKTOP_NODE_BINARY`, `DSH_DESKTOP_NPM_BINARY`, and `DSH_DESKTOP_PNPM_BINARY`.

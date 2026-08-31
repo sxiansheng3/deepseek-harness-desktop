@@ -8,11 +8,13 @@ import {
   isNetworkFailure,
   networkAttemptsForProxyResolution,
   parseRuntimeUrl,
+  parseRuntimeReleaseFeed,
   pathDelimiter,
   removeRuntimePath,
   resolveToolInvocation,
   runtimeInstallDirectory,
   runtimeInstallPlan,
+  runtimeVersionFromReleaseTag,
   RUNTIME_INSTALL_TIMEOUT_MS,
   runtimeWebArgs,
   RuntimeManager,
@@ -28,8 +30,13 @@ const require = createRequire(import.meta.url)
 const { installWindowsRuntimeFsShim, isManagedFallbackLink } = require('../src/windows-runtime-fs-shim.cjs')
 
 test('parses the exact loopback runtime URL from startup output', () => {
-  assert.equal(parseRuntimeUrl('ready\ndsh web: http://127.0.0.1:3080\n'), 'http://127.0.0.1:3080')
+  assert.equal(parseRuntimeUrl('ready\ndsh web: http://127.0.0.1:3080\n'), 'http://127.0.0.1:3080/')
+  assert.equal(
+    parseRuntimeUrl('dsh web: http://127.0.0.1:3080/?token=one-time-token (LAN: http://192.168.1.2:3080/?token=one-time-token)'),
+    'http://127.0.0.1:3080/?token=one-time-token',
+  )
   assert.equal(parseRuntimeUrl('dsh web: http://0.0.0.0:3080'), undefined)
+  assert.equal(parseRuntimeUrl('dsh web: https://127.0.0.1:3080/?token=unsafe'), undefined)
 })
 
 test('rejects unsafe version strings before using them in paths or npm specs', () => {
@@ -42,6 +49,38 @@ test('rejects unsafe version strings before using them in paths or npm specs', (
 test('reports registry dist-tag changes without guessing prerelease ordering', () => {
   assert.deepEqual(describeUpdate('0.1.0-rc.6', '0.1.0-rc.6'), { available: false, version: '0.1.0-rc.6' })
   assert.deepEqual(describeUpdate('0.1.0-rc.5', '0.1.0-rc.6'), { available: true, version: '0.1.0-rc.6' })
+})
+
+test('recognizes every official GitHub Runtime release tag form', () => {
+  assert.equal(runtimeVersionFromReleaseTag('dsh-v0.1.2-alpha.2'), '0.1.2-alpha.2')
+  assert.equal(runtimeVersionFromReleaseTag('v0.1.1-rc.2'), '0.1.1-rc.2')
+  assert.equal(runtimeVersionFromReleaseTag('0.1.0-rc.8'), '0.1.0-rc.8')
+  assert.equal(runtimeVersionFromReleaseTag('../../latest'), undefined)
+  assert.equal(runtimeVersionFromReleaseTag('release-notes'), undefined)
+  assert.equal(runtimeVersionFromReleaseTag('%E0%A4%A'), undefined)
+})
+
+test('reads prereleases and release notes from the official GitHub Atom feed', () => {
+  const releases = parseRuntimeReleaseFeed(`<?xml version="1.0"?>
+    <feed>
+      <entry>
+        <id>tag:github.com,2008:Repository/1/dsh-v0.1.2-alpha.2</id>
+        <updated>2026-08-30T13:52:14Z</updated>
+        <link rel="alternate" type="text/html" href="https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.2-alpha.2"/>
+        <title>v0.1.2-alpha.2</title>
+        <content type="html">&lt;h3&gt;新增功能&lt;/h3&gt;&lt;ul&gt;&lt;li&gt;支持 Alpha 更新&lt;/li&gt;&lt;/ul&gt;</content>
+      </entry>
+      <entry>
+        <id>tag:github.com,2008:Repository/1/dsh-v0.1.1-rc.2</id>
+        <link rel="alternate" href="https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.1-rc.2"/>
+        <title>v0.1.1-rc.2</title>
+      </entry>
+    </feed>`)
+  assert.equal(releases[0].version, '0.1.2-alpha.2')
+  assert.equal(releases[0].title, 'v0.1.2-alpha.2')
+  assert.match(releases[0].body, /新增功能\n- 支持 Alpha 更新/)
+  assert.equal(releases[0].publishedAt, '2026-08-30T13:52:14Z')
+  assert.equal(releases[1].version, '0.1.1-rc.2')
 })
 
 test('allows a Runtime installation to run for 100 minutes', () => {
@@ -96,23 +135,57 @@ test('only connection failures trigger an alternate download route', () => {
   assert.equal(isNetworkFailure(new Error('npm exited with 1\nERESOLVE unable to resolve dependency tree')), false)
 })
 
-test('version checks fall back from the system network stack to a direct connection', async () => {
+test('version checks follow the newest GitHub release even when npm latest still points to an RC', async () => {
   const calls = []
+  const feed = `<feed><entry>
+    <id>tag:github.com,2008:Repository/1/dsh-v0.1.2-alpha.2</id>
+    <link rel="alternate" href="https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.2-alpha.2"/>
+    <title>v0.1.2-alpha.2</title>
+    <content type="html">&lt;p&gt;Alpha release&lt;/p&gt;</content>
+  </entry></feed>`
   const runtime = new RuntimeManager({
     root: '/tmp/runtime',
     nodeBinary: 'node',
     npmBinary: 'npm',
-    systemFetch: async () => {
-      calls.push('system')
-      throw new Error('proxy connection failed')
+    systemFetch: async url => {
+      calls.push(`system:${url}`)
+      if (url.includes('github.com')) throw new Error('proxy connection failed')
+      return new Response(JSON.stringify({
+        'dist-tags': { latest: '0.1.1-rc.2', alpha: '0.1.2-alpha.2' },
+        versions: { '0.1.1-rc.2': {}, '0.1.2-alpha.2': {} },
+      }), { status: 200 })
     },
-    directFetch: async () => {
-      calls.push('direct')
-      return new Response(JSON.stringify({ 'dist-tags': { latest: '0.1.1-rc.2' } }), { status: 200 })
+    directFetch: async url => {
+      calls.push(`direct:${url}`)
+      return new Response(feed, { status: 200 })
     },
   })
-  assert.equal(await runtime.getLatestVersion(), '0.1.1-rc.2')
-  assert.deepEqual(calls, ['system', 'direct'])
+  assert.equal(await runtime.getLatestVersion(), '0.1.2-alpha.2')
+  assert.deepEqual(calls, [
+    'system:https://github.com/deepseek-ai/deepseek-harness/releases.atom',
+    'system:https://registry.npmjs.org/@deepseek-ai%2fdsh',
+    'direct:https://github.com/deepseek-ai/deepseek-harness/releases.atom',
+  ])
+})
+
+test('reports a published GitHub release that has no installable npm package yet', async () => {
+  const feed = `<feed><entry>
+    <id>tag:github.com,2008:Repository/1/dsh-v0.1.3-alpha.1</id>
+    <link rel="alternate" href="https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.3-alpha.1"/>
+    <title>v0.1.3-alpha.1</title>
+  </entry></feed>`
+  const runtime = new RuntimeManager({
+    root: '/tmp/runtime',
+    nodeBinary: 'node',
+    npmBinary: 'npm',
+    directFetch: async url => url.includes('github.com')
+      ? new Response(feed, { status: 200 })
+      : new Response(JSON.stringify({ versions: { '0.1.2-alpha.2': {} } }), { status: 200 }),
+  })
+  await assert.rejects(
+    runtime.getLatestVersion(),
+    /已发布 Harness 0\.1\.3-alpha\.1，但对应 npm 安装包尚未发布/,
+  )
 })
 
 test('version-check failures retain every attempted network route', async () => {
