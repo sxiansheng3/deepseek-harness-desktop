@@ -5,6 +5,7 @@ import {
   DesktopUpdateManager,
   isDesktopUpdateNetworkFailure,
   normalizeReleaseNotes,
+  releaseNotesToPlainText,
 } from '../src/desktop-update-manager.js'
 
 class FakeUpdater extends EventEmitter {
@@ -60,6 +61,15 @@ test('normalizes desktop release notes from macOS updater metadata', () => {
     { version: '0.1.6', note: '支持代理回退' },
   ]), '新增更新速度\n\n支持代理回退')
   assert.equal(normalizeReleaseNotes(undefined), '')
+})
+
+test('renders GitHub HTML release notes as readable plain text', () => {
+  const html = '<h2>图片兼容修复</h2><ul><li>修复图片能力判断。</li><li>避免 read_image &amp; crop 重复调用。</li></ul><script>alert(1)</script>'
+  assert.equal(
+    releaseNotesToPlainText(html),
+    '图片兼容修复\n• 修复图片能力判断。\n• 避免 read_image & crop 重复调用。',
+  )
+  assert.equal(normalizeReleaseNotes([{ note: '<p>第一项</p>' }, { note: '<p>第二项</p>' }]), '第一项\n\n第二项')
 })
 
 test('recognizes only network failures as eligible for a direct retry', () => {

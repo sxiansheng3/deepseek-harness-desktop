@@ -1,6 +1,6 @@
 {
   "name": "deepseek-harness-desktop",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "private": true,
   "description": "Desktop shell with independently updatable DeepSeek Harness runtime",
   "author": "tao song",

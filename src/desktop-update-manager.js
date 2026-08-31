@@ -1,8 +1,39 @@
+function decodeHtmlEntities(value) {
+  const named = {
+    amp: '&',
+    apos: "'",
+    gt: '>',
+    lt: '<',
+    nbsp: ' ',
+    quot: '"',
+  }
+  return value.replace(/&(?:#(\d+)|#x([\da-f]+)|([a-z]+));/gi, (entity, decimal, hexadecimal, name) => {
+    if (decimal !== undefined) return String.fromCodePoint(Number(decimal))
+    if (hexadecimal !== undefined) return String.fromCodePoint(Number.parseInt(hexadecimal, 16))
+    return named[name.toLowerCase()] ?? entity
+  })
+}
+
+export function releaseNotesToPlainText(value) {
+  if (typeof value !== 'string') return ''
+  if (!/<[a-z][\s\S]*?>/i.test(value)) return value.trim()
+  return decodeHtmlEntities(value
+    .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<li\b[^>]*>/gi, '• ')
+    .replace(/<\/(?:blockquote|div|h[1-6]|li|ol|p|pre|tr|ul)>/gi, '\n')
+    .replace(/<[^>]+>/g, ''))
+    .replaceAll('\u00a0', ' ')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
 export function normalizeReleaseNotes(releaseNotes) {
-  if (typeof releaseNotes === 'string') return releaseNotes.trim()
+  if (typeof releaseNotes === 'string') return releaseNotesToPlainText(releaseNotes)
   if (!Array.isArray(releaseNotes)) return ''
   return releaseNotes
-    .map(note => typeof note?.note === 'string' ? note.note.trim() : '')
+    .map(note => releaseNotesToPlainText(note?.note))
     .filter(Boolean)
     .join('\n\n')
 }
