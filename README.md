@@ -31,6 +31,7 @@ DeepSeek Harness Desktop is an Electron shell around the official, open-source D
 - Prefers the official Harness image path, automatically bridges the first undeclared image request through that same model, and restores verified declarations after independent Harness Runtime updates without blocking those updates.
 - Prevents native attachments from being re-read through image tools and handles provider-specific thinking controls so ordinary image answers do not expose internal reasoning or duplicate tool workflows.
 - Converts GitHub's HTML desktop release notes into readable plain text before showing the native update confirmation dialog.
+- Replaces raw Runtime and MCP startup stacks with a concise actionable error while retaining a redacted local diagnostic log.
 - Forces Harness session telemetry to `DISABLED` unless the deployment explicitly overrides it.
 - Uses the DeepSeek fish mark from the official Harness repository. This desktop application is an independent build and must not be represented as an official DeepSeek distribution.
 - Packages separate native Node.js toolchains for Apple Silicon macOS and x64 Windows, while keeping one shared desktop shell and Runtime update flow.

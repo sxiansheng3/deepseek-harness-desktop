@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import {
   assertRuntimeCapabilities,
   assertSafeVersion,
+  conciseRuntimeStartupFailure,
   describeUpdate,
   environmentForNetworkAttempt,
   isNetworkFailure,
@@ -23,6 +24,7 @@ import {
   sanitizeRuntimeOutput,
   RuntimeManager,
   terminateChild,
+  writeRuntimeStartupDiagnostic,
 } from '../src/runtime-manager.js'
 import { bundledToolDirectory, bundledToolPath } from '../src/tool-layout.js'
 import { createRequire } from 'node:module'
@@ -119,6 +121,32 @@ test('reports stderr startup failures and removes secrets from the user-visible 
   assert.match(error.message, /错误输出：/)
   assert.match(error.message, /api_key=\[已隐藏\]/)
   assert.doesNotMatch(error.message, /private/)
+})
+
+test('summarizes an MCP startup failure and preserves full sanitized diagnostics on disk', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-startup-diagnostic-'))
+  const stderr = `Processing request of type ListToolsRequest
+Error: dsh: plugin tree failed to load: failed to apply loader entry ds-mcp-lldb-native (@deepseek-ai/dsh-mcp-client): mcp-client(lldb_native): initial connection failed
+McpError: MCP error -32000: Connection closed
+    at Client._onclose (file:///runtime/protocol.js:263:32)
+Authorization: Bearer private-token`
+  try {
+    const error = runtimeStartupError(1, '', stderr)
+    const path = await writeRuntimeStartupDiagnostic(root, error, 1_788_000_000_000)
+    const summary = conciseRuntimeStartupFailure(error, path)
+    assert.match(summary, /失败组件：ds-mcp-lldb-native \/ lldb_native/)
+    assert.match(summary, /MCP -32000：Connection closed/)
+    assert.match(summary, /完整诊断日志已保存/)
+    assert.doesNotMatch(summary, /dsh-startup-diagnostic/)
+    assert.doesNotMatch(summary, /protocol\.js|ListToolsRequest|private-token/)
+    assert.ok(summary.length < 700)
+    const diagnostic = await readFile(path, 'utf8')
+    assert.match(diagnostic, /protocol\.js:263:32/)
+    assert.match(diagnostic, /Authorization: Bearer \[已隐藏\]/)
+    assert.doesNotMatch(diagnostic, /private-token/)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
 })
 
 test('quarantines only the generated shared profile fallback and preserves user profile data', async () => {

@@ -2,10 +2,15 @@ import { app, BrowserWindow, dialog, ipcMain, session, shell } from 'electron'
 import { randomUUID } from 'node:crypto'
 import { access } from 'node:fs/promises'
 import { join } from 'node:path'
-import { RuntimeManager } from './runtime-manager.js'
+import {
+  conciseRuntimeStartupFailure,
+  RuntimeManager,
+  writeRuntimeStartupDiagnostic,
+} from './runtime-manager.js'
 import { bundledRuntimeStartupAction, loadBundledRuntime } from './bundled-runtime.js'
 import { DesktopUpdateManager } from './desktop-update-manager.js'
 import { buildRuntimeUpdateDialogHtml, runtimeUpdateDialogAction } from './runtime-update-dialog.js'
+import { isHiddenAcceptance, loadLocalRuntimeUrl } from './local-runtime-loader.js'
 import { installApplicationMenu } from './menu.js'
 import { bundledToolDirectory, bundledToolPath } from './tool-layout.js'
 import {
@@ -59,6 +64,7 @@ async function resolveBundledRuntime() {
 }
 
 function createWindow() {
+  const hiddenAcceptance = isHiddenAcceptance()
   const window = new BrowserWindow({
     width: 1440,
     height: 920,
@@ -78,7 +84,7 @@ function createWindow() {
     if (url.startsWith('https://') || url.startsWith('http://')) void shell.openExternal(url)
     return { action: 'deny' }
   })
-  window.once('ready-to-show', () => window.show())
+  if (!hiddenAcceptance) window.once('ready-to-show', () => window.show())
   window.on('closed', () => { if (mainWindow === window) mainWindow = undefined })
   return window
 }
@@ -98,6 +104,10 @@ function sendVisionStatus(status) {
 function harnessApiUrl(method) {
   if (runtime?.currentUrl === undefined) throw new Error('Harness Runtime 尚未就绪')
   return new URL(`/api/${method}`, runtime.currentUrl)
+}
+
+async function loadHarnessUrl(url) {
+  return loadLocalRuntimeUrl(value => mainWindow.loadURL(value), url)
 }
 
 async function callHarness(method, payload) {
@@ -368,7 +378,7 @@ async function startDesktopApplicationUpdate() {
       cancelId: 1,
     })
     if (install.response !== 0) {
-      if (runtime?.currentUrl && !mainWindow.isDestroyed()) await mainWindow.loadURL(runtime.currentUrl)
+      if (runtime?.currentUrl && !mainWindow.isDestroyed()) await loadHarnessUrl(runtime.currentUrl)
       return
     }
     await runtime.stop()
@@ -382,7 +392,7 @@ async function startDesktopApplicationUpdate() {
       detail: formatUpdateFailure(error, status.update.version),
       buttons: ['返回 Harness'],
     })
-    if (runtime?.currentUrl && !mainWindow.isDestroyed()) await mainWindow.loadURL(runtime.currentUrl)
+    if (runtime?.currentUrl && !mainWindow.isDestroyed()) await loadHarnessUrl(runtime.currentUrl)
   }
 }
 
@@ -405,7 +415,7 @@ async function checkForUpdates({ interactive = true } = {}) {
     if (action !== 'update') return
     await showUpdateProgress(update.version)
     const installed = await runtime.updateAndRestart(update.version)
-    await mainWindow.loadURL(installed.url)
+    await loadHarnessUrl(installed.url)
     await dialog.showMessageBox(mainWindow, {
       type: 'info',
       title: '更新完成',
@@ -420,7 +430,7 @@ async function checkForUpdates({ interactive = true } = {}) {
       detail,
       buttons: ['返回 Harness'],
     })
-    if (runtime?.currentUrl && !mainWindow.isDestroyed()) await mainWindow.loadURL(runtime.currentUrl)
+    if (runtime?.currentUrl && !mainWindow.isDestroyed()) await loadHarnessUrl(runtime.currentUrl)
   }
 }
 
@@ -447,7 +457,7 @@ async function rollbackRuntime() {
   try {
     await showSplash(`正在回退到 Harness ${state.previousVersion}…`)
     const result = await runtime.rollback()
-    await mainWindow.loadURL(result.url)
+    await loadHarnessUrl(result.url)
   } catch (error) {
     await dialog.showMessageBox(mainWindow, {
       type: 'error',
@@ -542,7 +552,7 @@ async function boot() {
     }
     url = await runtime.start(version)
   }
-  await mainWindow.loadURL(url)
+  await loadHarnessUrl(url)
   if (bundledUpgradeError !== undefined) {
     await dialog.showMessageBox(mainWindow, {
       type: 'warning',
@@ -567,14 +577,36 @@ if (!app.requestSingleInstanceLock()) {
   })
 
   app.whenReady().then(boot).catch(async error => {
-    await dialog.showErrorBox('无法启动 DeepSeek Harness Desktop', error instanceof Error ? error.stack || error.message : String(error))
+    let diagnosticPath
+    if (runtime?.root) {
+      try {
+        diagnosticPath = await writeRuntimeStartupDiagnostic(runtime.root, error)
+      } catch (diagnosticError) {
+        console.warn(`Unable to write startup diagnostic: ${diagnosticError instanceof Error ? diagnosticError.message : String(diagnosticError)}`)
+      }
+    }
+    if (isHiddenAcceptance()) {
+      console.error(conciseRuntimeStartupFailure(error, diagnosticPath))
+      app.exit(1)
+      return
+    }
+    const result = await dialog.showMessageBox({
+      type: 'error',
+      title: '无法启动 DeepSeek Harness Desktop',
+      message: 'Harness Runtime 未能启动',
+      detail: conciseRuntimeStartupFailure(error, diagnosticPath),
+      buttons: diagnosticPath ? ['退出', '打开日志目录'] : ['退出'],
+      defaultId: 0,
+      cancelId: 0,
+    })
+    if (result.response === 1 && diagnosticPath) shell.showItemInFolder(diagnosticPath)
     app.quit()
   })
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0 && runtime?.currentUrl) {
       mainWindow = createWindow()
-      void mainWindow.loadURL(runtime.currentUrl)
+      void loadHarnessUrl(runtime.currentUrl)
     }
   })
 

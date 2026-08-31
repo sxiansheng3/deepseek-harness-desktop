@@ -235,17 +235,67 @@ export function runtimeWebArgs(entry, port, helpText) {
   return [entry, 'web', ...(helpText.includes('--no-open') ? ['--no-open'] : []), '--port', String(selectedPort)]
 }
 
-/** Keep startup diagnostics useful without exposing one-time URLs or credentials in an error dialog. */
-export function sanitizeRuntimeOutput(output) {
+function redactRuntimeOutput(output) {
   return String(output ?? '')
     .replace(/([?&](?:access_token|api_key|key|password|secret|token)=)[^&\s)]+/gi, '$1[已隐藏]')
     .replace(/(authorization:\s*(?:basic|bearer)\s+)\S+/gi, '$1[已隐藏]')
+}
+
+/** Keep startup diagnostics useful without exposing one-time URLs or credentials in an error dialog. */
+export function sanitizeRuntimeOutput(output) {
+  return redactRuntimeOutput(output)
     .trim()
     .slice(-8_000)
 }
 
+export function conciseRuntimeStartupFailure(error, diagnosticPath) {
+  const source = [error?.stderr, error?.stdout, error?.message]
+    .filter(value => typeof value === 'string' && value.trim() !== '')
+    .join('\n')
+  const loaderEntries = [...source.matchAll(/loader entry\s+([^\s(]+)\s*\([^)]*\)/gi)].map(match => match[1])
+  const loader = loaderEntries.findLast(entry => !/^(?:include|web)$/i.test(entry)) ?? loaderEntries.at(-1)
+  const client = source.match(/mcp-client\(([^)]+)\)/i)?.[1]
+  const mcp = source.match(/MCP error\s*(-?\d+)\s*:\s*([^\n]+)/i)
+  const directCause = mcp
+    ? `MCP ${mcp[1]}：${mcp[2].trim()}`
+    : source.split('\n').map(line => line.trim()).find(line =>
+      line !== ''
+      && !/^(?:at\s|file:|listtoolsrequest|processing request|throw new error|\^)/i.test(line)
+      && !/^(?:标准输出|错误输出)/.test(line))
+  const component = [loader, client && client !== loader ? client : undefined].filter(Boolean).join(' / ')
+  return [
+    component ? `失败组件：${component}` : undefined,
+    directCause ? `直接原因：${directCause.slice(0, 360)}` : '直接原因：Harness Runtime 在启动期间退出。',
+    component
+      ? '建议：检查或暂时停用该 MCP 插件后，再重新打开桌面版。其他模型、会话和 Runtime 数据不会因此被删除。'
+      : '建议：重新打开桌面版；如果仍失败，请根据诊断日志检查最后一个启动组件。',
+    diagnosticPath ? '完整诊断日志已保存，可点击“打开日志目录”查看。' : undefined,
+  ].filter(Boolean).join('\n')
+}
+
+export async function writeRuntimeStartupDiagnostic(root, error, timestamp = Date.now()) {
+  const directory = join(root, 'logs')
+  const path = join(directory, `startup-error-${new Date(timestamp).toISOString().replaceAll(':', '-')}.log`)
+  const stdout = error?.diagnosticStdout ?? error?.stdout ?? ''
+  const stderr = error?.diagnosticStderr ?? error?.stderr ?? ''
+  const fallback = error instanceof Error ? error.stack || error.message : String(error)
+  const body = [
+    `timestamp: ${new Date(timestamp).toISOString()}`,
+    `stage: ${error?.stage ?? 'unknown'}`,
+    `exitCode: ${error?.exitCode ?? 'unknown'}`,
+    stdout ? `\n[stdout]\n${stdout}` : undefined,
+    stderr ? `\n[stderr]\n${stderr}` : undefined,
+    !stdout && !stderr ? `\n[error]\n${fallback}` : undefined,
+  ].filter(Boolean).join('\n')
+  await mkdir(directory, { recursive: true, mode: 0o700 })
+  await writeFile(path, `${redactRuntimeOutput(body).trim()}\n`, { mode: 0o600 })
+  return path
+}
+
 /** Preserve both output streams because upstream startup failures are commonly written only to stderr. */
 export function runtimeStartupError(code, stdout, stderr) {
+  const diagnosticStdout = redactRuntimeOutput(stdout).trim()
+  const diagnosticStderr = redactRuntimeOutput(stderr).trim()
   const safeStdout = sanitizeRuntimeOutput(stdout)
   const safeStderr = sanitizeRuntimeOutput(stderr)
   const details = [
@@ -260,6 +310,8 @@ export function runtimeStartupError(code, stdout, stderr) {
   error.exitCode = code
   error.stdout = safeStdout
   error.stderr = safeStderr
+  error.diagnosticStdout = diagnosticStdout
+  error.diagnosticStderr = diagnosticStderr
   return error
 }
 
