@@ -1,4 +1,5 @@
 import { app, BrowserWindow, dialog, ipcMain, session, shell } from 'electron'
+import { randomUUID } from 'node:crypto'
 import { access } from 'node:fs/promises'
 import { join } from 'node:path'
 import { RuntimeManager } from './runtime-manager.js'
@@ -7,6 +8,11 @@ import { DesktopUpdateManager } from './desktop-update-manager.js'
 import { buildRuntimeUpdateDialogHtml, runtimeUpdateDialogAction } from './runtime-update-dialog.js'
 import { installApplicationMenu } from './menu.js'
 import { bundledToolDirectory, bundledToolPath } from './tool-layout.js'
+import {
+  parseHarnessRequest,
+  selectedModelFromSessionModelsResponse,
+  VisionCompatibilityManager,
+} from './vision-compatibility-manager.js'
 import electronUpdater from 'electron-updater'
 
 const { autoUpdater } = electronUpdater
@@ -15,7 +21,12 @@ const APP_NAME = 'DeepSeek Harness Desktop'
 let mainWindow
 let runtime
 let desktopUpdater
+let visionCompatibility
 let shuttingDown = false
+const recentImagePrompts = new Map()
+const visionFallbacks = new Set()
+const completedVisionFallbacks = new Set()
+const visionFallbackAttempts = new Map()
 
 function resolveTool(name, override) {
   if (override) return override
@@ -79,6 +90,103 @@ function assertTrustedHarnessSender(event) {
   }
 }
 
+function sendVisionStatus(status) {
+  if (mainWindow === undefined || mainWindow.isDestroyed()) return
+  mainWindow.webContents.send('desktop-vision:status', status)
+}
+
+function harnessApiUrl(method) {
+  if (runtime?.currentUrl === undefined) throw new Error('Harness Runtime 尚未就绪')
+  return new URL(`/api/${method}`, runtime.currentUrl)
+}
+
+async function callHarness(method, payload) {
+  const rpcId = randomUUID()
+  const response = await session.defaultSession.fetch(harnessApiUrl(method), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ type: 'client-request', rpcId, method, payload }),
+    signal: AbortSignal.timeout(30_000),
+  })
+  if (!response.ok) throw new Error(`Harness ${method} 请求失败（HTTP ${response.status}）`)
+  const body = await response.json()
+  if (body?.type !== 'server-response' || body.rpcId !== rpcId) throw new Error(`Harness ${method} 返回了无效响应`)
+  if (body.result?.ok !== true) throw new Error(body.result?.error?.message ?? `Harness ${method} 请求被拒绝`)
+  return body
+}
+
+function imagePromptContent(request) {
+  return Array.isArray(request?.payload?.content)
+    ? request.payload.content.filter(part => part?.type === 'text' || part?.type === 'image')
+    : []
+}
+
+async function bridgeImagePrompt(request, { force = false } = {}) {
+  if (visionCompatibility === undefined || visionFallbacks.has(request.rpcId)) return false
+  if (completedVisionFallbacks.has(request.rpcId)) return true
+  const content = imagePromptContent(request)
+  if (!content.some(part => part?.type === 'image')) return false
+  visionFallbacks.add(request.rpcId)
+  try {
+    const modelsResponse = await callHarness('session.models', { sessionId: request.payload.sessionId })
+    const selected = selectedModelFromSessionModelsResponse(modelsResponse)
+    if (selected === undefined) throw new Error('无法确定当前会话使用的模型')
+    if (!force && await visionCompatibility.routeDeclaresImage(selected.provider, selected.model)) return false
+    const attempts = visionFallbackAttempts.get(request.rpcId) ?? 0
+    if (attempts >= 2) return false
+    visionFallbackAttempts.set(request.rpcId, attempts + 1)
+    sendVisionStatus({ state: 'bridging', provider: selected.provider, model: selected.model })
+    const analysis = await visionCompatibility.analyzeAndRemember({ ...selected, content })
+    const originalQuestion = content.filter(part => part?.type === 'text').map(part => part.text).join('\n').trim()
+    const compatibilityPrompt = [
+      '[DeepSeek Harness Desktop 视觉兼容层]',
+      '桌面端已经使用当前模型成功读取了用户本次上传的图片。请直接依据下面的视觉结果回答用户，不要声称无法看到图片，也不要要求用户重复上传。',
+      originalQuestion ? `用户原问题：\n${originalQuestion}` : '用户原问题：请描述上传的图片。',
+      `视觉读取结果：\n${analysis}`,
+    ].join('\n\n')
+    await callHarness('session.prompt', {
+      sessionId: request.payload.sessionId,
+      mode: request.payload.mode === 'steer' ? 'steer' : 'queue',
+      content: [{ type: 'text', text: compatibilityPrompt }],
+      ...(typeof request.payload.clientTimeZone === 'string' ? { clientTimeZone: request.payload.clientTimeZone } : {}),
+    })
+    completedVisionFallbacks.add(request.rpcId)
+    sendVisionStatus({
+      state: 'complete',
+      provider: selected.provider,
+      model: selected.model,
+      mode: 'bridge-and-remember',
+    })
+    return true
+  } catch (error) {
+    sendVisionStatus({ state: 'error', message: error instanceof Error ? error.message : String(error) })
+    return false
+  } finally {
+    visionFallbacks.delete(request.rpcId)
+  }
+}
+
+function installVisionPromptCapture() {
+  session.defaultSession.webRequest.onBeforeRequest(
+    { urls: ['http://127.0.0.1:*/api/session.prompt*'] },
+    details => {
+      const chunks = details.uploadData?.flatMap(item => item.bytes === undefined ? [] : [Buffer.from(item.bytes)]) ?? []
+      if (chunks.length === 0) return
+      const bytes = Buffer.concat(chunks)
+      const request = parseHarnessRequest(bytes)
+      if (request === undefined || !imagePromptContent(request).some(part => part?.type === 'image')) return
+      recentImagePrompts.set(details.webContentsId, { request, capturedAt: Date.now() })
+      setTimeout(() => { void bridgeImagePrompt(request) }, 450)
+      setTimeout(() => {
+        const recent = recentImagePrompts.get(details.webContentsId)
+        if (recent?.request.rpcId === request.rpcId) recentImagePrompts.delete(details.webContentsId)
+        completedVisionFallbacks.delete(request.rpcId)
+        visionFallbackAttempts.delete(request.rpcId)
+      }, 120_000)
+    },
+  )
+}
+
 function installDesktopUpdateIpc() {
   ipcMain.handle('desktop-harness:get-update-status', async event => {
     assertTrustedHarnessSender(event)
@@ -106,6 +214,16 @@ function installDesktopUpdateIpc() {
   ipcMain.handle('desktop-shell:start-update', async event => {
     assertTrustedHarnessSender(event)
     await startDesktopApplicationUpdate()
+  })
+  ipcMain.handle('desktop-vision:get-status', async event => {
+    assertTrustedHarnessSender(event)
+    return visionCompatibility.publicStatus()
+  })
+  ipcMain.handle('desktop-vision:retry-last', async event => {
+    assertTrustedHarnessSender(event)
+    const recent = recentImagePrompts.get(event.sender.id)
+    if (recent === undefined || Date.now() - recent.capturedAt > 60_000) return false
+    return bridgeImagePrompt(recent.request, { force: true })
   })
 }
 
@@ -374,6 +492,13 @@ async function boot() {
     },
   })
   await runtime.initialize()
+  visionCompatibility = new VisionCompatibilityManager({
+    root: runtime.root,
+    harnessHome: runtime.harnessHome,
+    fetchImpl: (input, init) => globalThis.fetch(input, init),
+  })
+  await visionCompatibility.initialize()
+  installVisionPromptCapture()
   installDesktopUpdateIpc()
   installApplicationMenu({
     runtime,
@@ -457,6 +582,7 @@ if (!app.requestSingleInstanceLock()) {
     if (shuttingDown || runtime === undefined) return
     event.preventDefault()
     shuttingDown = true
+    visionCompatibility?.dispose()
     void runtime.stop().finally(() => app.quit())
   })
 

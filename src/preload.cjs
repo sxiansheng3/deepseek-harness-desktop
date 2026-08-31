@@ -16,6 +16,13 @@ const desktopHarness = {
     ipcRenderer.on('desktop-shell:update-status', listener)
     return () => ipcRenderer.removeListener('desktop-shell:update-status', listener)
   },
+  getVisionStatus: () => ipcRenderer.invoke('desktop-vision:get-status'),
+  retryLastImage: () => ipcRenderer.invoke('desktop-vision:retry-last'),
+  onVisionStatus: callback => {
+    const listener = (_event, status) => callback(status)
+    ipcRenderer.on('desktop-vision:status', listener)
+    return () => ipcRenderer.removeListener('desktop-vision:status', listener)
+  },
 }
 
 contextBridge.exposeInMainWorld('desktopHarness', desktopHarness)
@@ -23,6 +30,8 @@ contextBridge.exposeInMainWorld('desktopHarness', desktopHarness)
 const STYLE_ID = 'dsh-desktop-settings-style'
 const PANEL_ID = 'dsh-desktop-settings-panel'
 const SHELL_UPDATE_ID = 'dsh-desktop-shell-update'
+const VISION_STATUS_ID = 'dsh-desktop-vision-status'
+let lastVisionRetryAt = 0
 
 function installStyles() {
   if (document.getElementById(STYLE_ID)) return
@@ -60,9 +69,39 @@ function installStyles() {
     }
     #${SHELL_UPDATE_ID}:hover { background: #1f55d5; }
     #${SHELL_UPDATE_ID} svg { width: 14px; height: 14px; }
+    #${VISION_STATUS_ID} {
+      position: fixed; left: 50%; top: 92px; z-index: 2147483647; transform: translateX(-50%);
+      max-width: min(620px, calc(100vw - 40px)); padding: 11px 15px; border-radius: 11px;
+      color: #fff; background: rgba(48, 53, 61, .94); box-shadow: 0 14px 38px rgba(0,0,0,.22);
+      font: 500 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    #${VISION_STATUS_ID}[data-state="error"] { background: rgba(166, 43, 43, .96); }
+    #${VISION_STATUS_ID}[data-state="complete"] { background: rgba(28, 119, 74, .96); }
     @keyframes dsh-shell-update-enter { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
   `
   document.head.appendChild(style)
+}
+
+function renderVisionStatus(status) {
+  let element = document.getElementById(VISION_STATUS_ID)
+  if (!element) {
+    element = document.createElement('div')
+    element.id = VISION_STATUS_ID
+    element.setAttribute('role', 'status')
+    element.setAttribute('aria-live', 'polite')
+    document.body.appendChild(element)
+  }
+  element.dataset.state = status?.state ?? 'idle'
+  if (status?.state === 'bridging') {
+    element.textContent = `Harness 未声明 ${status.provider}/${status.model} 的图片能力，正在自动使用视觉兼容通道…`
+  } else if (status?.state === 'complete') {
+    element.textContent = `图片已通过 ${status.provider}/${status.model} 成功读取；该模型已记住，后续优先走 Harness 原生图片。`
+  } else if (status?.state === 'error') {
+    element.textContent = `图片兼容发送失败：${status.message ?? '未知错误'}`
+  } else {
+    element.textContent = ''
+  }
+  if (status?.state !== 'bridging') setTimeout(() => element?.remove(), status?.state === 'error' ? 10_000 : 5_000)
 }
 
 function renderDesktopUpdateBadge(status) {
@@ -127,6 +166,16 @@ async function renderDesktopSettings(dialog, desktopButton) {
       </div>
       <div class="dsh-desktop-status" role="status" aria-live="polite" data-dsh-status></div>
     </div>
+    <div class="dsh-desktop-card">
+      <div class="dsh-desktop-row">
+        <div>
+          <div class="dsh-desktop-label">图片兼容</div>
+          <div class="dsh-desktop-value" data-dsh-vision>正在读取…</div>
+        </div>
+        <div class="dsh-desktop-label">原生优先 · 自动回退</div>
+      </div>
+      <div class="dsh-desktop-status">只对真实成功读取过图片的精确模型启用图片声明；Harness 更新不会被阻止。</div>
+    </div>
   `
   options.appendChild(panel)
   desktopButton.classList.add('dsh-desktop-selected')
@@ -136,6 +185,7 @@ async function renderDesktopSettings(dialog, desktopButton) {
   const status = panel.querySelector('[data-dsh-status]')
   const check = panel.querySelector('[data-dsh-check]')
   const rollback = panel.querySelector('[data-dsh-rollback]')
+  const vision = panel.querySelector('[data-dsh-vision]')
 
   async function refresh() {
     try {
@@ -145,6 +195,10 @@ async function renderDesktopSettings(dialog, desktopButton) {
         : `尚未安装（官方最新：${result.latestVersion}）`
       status.textContent = result.available ? '发现新版本，可以一键更新。' : '当前已是最新版。'
       rollback.disabled = !result.canRollback
+      const visionResult = await desktopHarness.getVisionStatus()
+      vision.textContent = visionResult.models.length === 0
+        ? '尚无已验证模型；首次上传时自动验证并回退'
+        : `已验证 ${visionResult.models.length} 个：${visionResult.models.map(item => `${item.provider}/${item.model}`).join('、')}`
     } catch (error) {
       version.textContent = '读取失败'
       status.textContent = error?.message ?? String(error)
@@ -210,10 +264,25 @@ function scanSettings() {
   }
 }
 
+function retryNewVisionRejection(mutations) {
+  const imageRejected = mutations.some(mutation => [...mutation.addedNodes].some(node => {
+    const text = node.nodeType === Node.TEXT_NODE ? node.textContent : node.innerText ?? node.textContent
+    return text?.includes('当前模型不支持图片') || text?.includes('MODEL_DOES_NOT_SUPPORT_IMAGES')
+  }))
+  if (imageRejected && Date.now() - lastVisionRetryAt > 2_000) {
+    lastVisionRetryAt = Date.now()
+    void desktopHarness.retryLastImage().catch(() => {})
+  }
+}
+
 window.addEventListener('DOMContentLoaded', () => {
   scanSettings()
-  new MutationObserver(scanSettings).observe(document.body, { childList: true, subtree: true })
+  new MutationObserver(mutations => {
+    scanSettings()
+    retryNewVisionRejection(mutations)
+  }).observe(document.body, { childList: true, subtree: true })
   if (location.hostname === '127.0.0.1') {
+    desktopHarness.onVisionStatus(renderVisionStatus)
     desktopHarness.onDesktopUpdateStatus(renderDesktopUpdateBadge)
     void desktopHarness.getDesktopUpdateStatus().then(renderDesktopUpdateBadge).catch(() => {})
   }
