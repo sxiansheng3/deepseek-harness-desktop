@@ -39,10 +39,13 @@ export function chineseReleaseNotes(value) {
 export function buildRuntimeUpdateDialogHtml(update) {
   const version = escapeHtml(update.version)
   const activeVersion = update.activeVersion === undefined ? undefined : escapeHtml(update.activeVersion)
-  const notes = escapeHtml(chineseReleaseNotes(update.releaseNotes?.body))
+  const notes = escapeHtml(!update.releaseNotes?.body && !update.releaseNotes?.url
+    ? '暂未获取到该版本的 GitHub 更新说明。安装来源和目标版本已核实，可稍后重新检查。'
+    : chineseReleaseNotes(update.releaseNotes?.body))
   const summary = activeVersion === undefined
     ? '安装后即可开始使用。'
-    : `当前版本 ${activeVersion}。更新失败时会自动恢复旧版本。`
+    : `当前版本 ${activeVersion}。请等待任务结束后更新；失败时自动恢复旧版本。`
+  const source = update.candidate?.source === 'source-build' ? '基于官方源码构建，已通过桌面兼容性验证。' : '来源：官方 npm。'
   const githubButton = update.releaseNotes?.url
     ? '<a class="button secondary" href="dsh-runtime-update://github">在 GitHub 查看</a>'
     : ''
@@ -160,7 +163,7 @@ export function buildRuntimeUpdateDialogHtml(update) {
   <main class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
     <header>
       <h1 id="dialog-title">发现新版本 ${version}</h1>
-      <p class="summary">${summary}</p>
+      <p class="summary">${summary}<br>${source}</p>
       <a class="close" href="dsh-runtime-update://cancel" aria-label="关闭更新窗口">×</a>
     </header>
     <section class="notes" aria-label="官方 GitHub 中文更新说明">

@@ -283,6 +283,7 @@ test('version checks follow the newest GitHub release even when npm latest still
   </entry></feed>`
   const runtime = new RuntimeManager({
     root: '/tmp/runtime',
+    channelUrl: null,
     nodeBinary: 'node',
     npmBinary: 'npm',
     systemFetch: async url => {
@@ -306,7 +307,7 @@ test('version checks follow the newest GitHub release even when npm latest still
   ])
 })
 
-test('reports a published GitHub release that has no installable npm package yet', async () => {
+test('keeps the latest installable npm version when the newest release has no package', async () => {
   const feed = `<feed><entry>
     <id>tag:github.com,2008:Repository/1/dsh-v0.1.3-alpha.1</id>
     <link rel="alternate" href="https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.3-alpha.1"/>
@@ -314,21 +315,23 @@ test('reports a published GitHub release that has no installable npm package yet
   </entry></feed>`
   const runtime = new RuntimeManager({
     root: '/tmp/runtime',
+    channelUrl: null,
     nodeBinary: 'node',
     npmBinary: 'npm',
     directFetch: async url => url.includes('github.com')
       ? new Response(feed, { status: 200 })
       : new Response(JSON.stringify({ versions: { '0.1.2-alpha.2': {} } }), { status: 200 }),
   })
-  await assert.rejects(
-    runtime.getLatestVersion(),
-    /已发布 Harness 0\.1\.3-alpha\.1，但对应 npm 安装包尚未发布/,
-  )
+  assert.equal(await runtime.getLatestVersion(), '0.1.2-alpha.2')
+  const status = await runtime.checkForUpdate()
+  assert.equal(status.latestPublishedVersion, '0.1.3-alpha.1')
+  assert.match(status.message, /对应安装包尚未就绪/)
 })
 
-test('version-check failures retain every attempted network route', async () => {
+test('version-check failures report no installable runtime without throwing away status', async () => {
   const runtime = new RuntimeManager({
     root: '/tmp/runtime',
+    channelUrl: null,
     nodeBinary: 'node',
     npmBinary: 'npm',
     systemFetch: async () => { throw new Error('proxy unavailable') },
@@ -336,7 +339,7 @@ test('version-check failures retain every attempted network route', async () => 
   })
   await assert.rejects(runtime.getLatestVersion(), error => {
     assert.equal(error.stage, 'check')
-    assert.deepEqual(error.attemptFailures.map(attempt => attempt.label), ['系统网络（含代理）', '直接连接'])
+    assert.match(error.message, /暂时没有可安装/)
     return true
   })
 })

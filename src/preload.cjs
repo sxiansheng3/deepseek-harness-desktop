@@ -1,6 +1,7 @@
 const { contextBridge, ipcRenderer } = require('electron')
 
 const desktopHarness = {
+  getLocalStatus: () => ipcRenderer.invoke('desktop-harness:get-local-status'),
   getUpdateStatus: () => ipcRenderer.invoke('desktop-harness:get-update-status'),
   checkForUpdates: () => ipcRenderer.invoke('desktop-harness:check-for-updates'),
   rollback: () => ipcRenderer.invoke('desktop-harness:rollback'),
@@ -52,7 +53,7 @@ function installStyles() {
     #${PANEL_ID} .dsh-desktop-row { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
     #${PANEL_ID} .dsh-desktop-label { font-size: 14px; font-weight: 600; }
     #${PANEL_ID} .dsh-desktop-value { margin-top: 5px; font-size: 13px; opacity: .64; }
-    #${PANEL_ID} .dsh-desktop-actions { display: flex; gap: 10px; margin-top: 18px; }
+    #${PANEL_ID} .dsh-desktop-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }
     #${PANEL_ID} button {
       appearance: none; border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
       border-radius: 9px; padding: 8px 13px; background: transparent; color: inherit;
@@ -60,7 +61,11 @@ function installStyles() {
     }
     #${PANEL_ID} button.dsh-desktop-primary { border-color: #246bfd; background: #246bfd; color: #fff; }
     #${PANEL_ID} button:disabled { cursor: default; opacity: .42; }
-    #${PANEL_ID} .dsh-desktop-status { margin-top: 14px; min-height: 20px; font-size: 13px; opacity: .72; }
+    #${PANEL_ID} .dsh-desktop-status { margin-top: 14px; min-height: 20px; font-size: 13px; opacity: .72; line-height: 1.6; overflow-wrap: anywhere; }
+    @media (max-width: 720px) {
+      #${PANEL_ID} { padding: 18px 16px; }
+      #${PANEL_ID} .dsh-desktop-row { flex-wrap: wrap; gap: 12px; }
+    }
     #${SHELL_UPDATE_ID} {
       position: fixed; right: 18px; top: 16px; z-index: 2147483647; display: inline-flex; align-items: center; gap: 8px;
       border: 1px solid color-mix(in srgb, #2864ee 45%, transparent); border-radius: 999px; padding: 8px 12px;
@@ -151,7 +156,7 @@ async function renderDesktopSettings(dialog, desktopButton) {
   panel.id = PANEL_ID
   panel.innerHTML = `
     <h2 class="dsh-desktop-heading">Harness 更新</h2>
-    <p class="dsh-desktop-copy">桌面版会直接安装并运行 DeepSeek 官方 Harness Runtime。更新前会展示官方 GitHub 已发布的版本说明；安装过程支持系统代理与直接连接自动回退。</p>
+    <p class="dsh-desktop-copy">优先使用官方 npm，也支持经过验证的官方源码构建版本。更新前可查看版本说明，安装失败时自动恢复原版本。仅保留当前版和可回退的上一版程序包。</p>
     <div class="dsh-desktop-card">
       <div class="dsh-desktop-row">
         <div>
@@ -160,6 +165,8 @@ async function renderDesktopSettings(dialog, desktopButton) {
         </div>
         <div class="dsh-desktop-label" data-dsh-auto>自动检查：已开启</div>
       </div>
+      <div class="dsh-desktop-value" data-dsh-published>正在检查官方发布…</div>
+      <div class="dsh-desktop-value" data-dsh-installable></div>
       <div class="dsh-desktop-actions">
         <button class="dsh-desktop-primary" type="button" data-dsh-check>检查并安装更新</button>
         <button type="button" data-dsh-rollback disabled>回退上一个版本</button>
@@ -188,21 +195,27 @@ async function renderDesktopSettings(dialog, desktopButton) {
   const vision = panel.querySelector('[data-dsh-vision]')
 
   async function refresh() {
-    try {
-      const result = await desktopHarness.getUpdateStatus()
-      version.textContent = result.activeVersion
-        ? `${result.activeVersion}（官方最新：${result.latestVersion}）`
-        : `尚未安装（官方最新：${result.latestVersion}）`
-      status.textContent = result.available ? '发现新版本，可以一键更新。' : '当前已是最新版。'
+    const local = desktopHarness.getLocalStatus().then(result => {
+      version.textContent = result.activeVersion || '尚未安装'
       rollback.disabled = !result.canRollback
-      const visionResult = await desktopHarness.getVisionStatus()
-      vision.textContent = visionResult.models.length === 0
+    }).catch(() => { version.textContent = '本地版本暂时无法读取' })
+    const remote = desktopHarness.getUpdateStatus().then(result => {
+      panel.querySelector('[data-dsh-published]').textContent = result.latestPublishedVersion
+        ? `GitHub 最新发布：${result.latestPublishedVersion}` : 'GitHub 最新发布：暂时无法检查'
+      panel.querySelector('[data-dsh-installable]').textContent = result.latestInstallableVersion
+        ? `最新可安装：${result.latestInstallableVersion} · ${result.candidate?.source === 'source-build' ? '基于官方源码构建' : '官方 npm'}`
+        : '最新可安装：暂未获取到可用安装包'
+      status.textContent = result.message
+    }).catch(() => {
+      panel.querySelector('[data-dsh-published]').textContent = 'GitHub 最新发布：暂时无法检查'
+      status.textContent = '更新检查暂时不可用，请稍后重试。'
+    })
+    const images = desktopHarness.getVisionStatus().then(result => {
+      vision.textContent = result.models.length === 0
         ? '尚无已验证模型；首次上传时自动验证并回退'
-        : `已验证 ${visionResult.models.length} 个：${visionResult.models.map(item => `${item.provider}/${item.model}`).join('、')}`
-    } catch (error) {
-      version.textContent = '读取失败'
-      status.textContent = error?.message ?? String(error)
-    }
+        : `已验证 ${result.models.length} 个：${result.models.map(item => `${item.provider}/${item.model}`).join('、')}`
+    }).catch(() => { vision.textContent = '图片兼容状态暂时无法读取，请重新打开设置。' })
+    await Promise.allSettled([local, remote, images])
   }
 
   check.addEventListener('click', async () => {

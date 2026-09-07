@@ -4,6 +4,7 @@ import { createReadStream } from 'node:fs'
 import { createServer } from 'node:net'
 import { access, cp, lstat, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
+import { RUNTIME_CHANNEL_URL, parseRuntimeChannel, downloadRuntimeArtifact, extractRuntimeArchive } from './runtime-artifacts.js'
 
 const PACKAGE_NAME = '@deepseek-ai/dsh'
 export const RUNTIME_REGISTRY_URL = 'https://registry.npmjs.org/@deepseek-ai%2fdsh'
@@ -104,10 +105,9 @@ export function parseRuntimeUrl(output) {
   }
 }
 
-/** Compare exact versions. Release ordering is owned by GitHub's published-release feed. */
+/** Only offer a strictly newer version; a missing source must never cause a downgrade. */
 export function describeUpdate(activeVersion, publishedVersion) {
-  if (activeVersion === publishedVersion) return { available: false, version: publishedVersion }
-  return { available: true, version: publishedVersion }
+  return { available: publishedVersion !== undefined && (activeVersion === undefined || compareRuntimeVersions(publishedVersion, activeVersion) > 0), version: publishedVersion }
 }
 
 function decodeEntities(value) {
@@ -547,6 +547,10 @@ export class RuntimeManager {
     onProgress,
     bundledRuntime,
     platform = process.platform,
+    arch = process.arch,
+    desktopVersion = '0.1.14',
+    channelUrl = RUNTIME_CHANNEL_URL,
+    assertCanSwitch = async () => {},
     logger = console,
   }) {
     this.root = root
@@ -571,6 +575,10 @@ export class RuntimeManager {
       throw new Error('Bundled Harness Runtime archive SHA-256 is invalid')
     }
     this.platform = platform
+    this.arch = arch
+    this.desktopVersion = desktopVersion
+    this.channelUrl = channelUrl
+    this.assertCanSwitch = assertCanSwitch
     this.logger = logger
     this.process = undefined
     this.currentUrl = undefined
@@ -630,7 +638,7 @@ export class RuntimeManager {
     return (await this.getLatestRelease()).version
   }
 
-  async fetchOfficialResource(url, { accept, label, parse }) {
+  async fetchOfficialResource(url, { accept, label, parse, allowMissing = false }) {
     const attempts = [
       ...(this.systemFetch ? [{ label: '系统网络（含代理）', fetcher: this.systemFetch }] : []),
       { label: '直接连接', fetcher: this.directFetch },
@@ -645,6 +653,7 @@ export class RuntimeManager {
           },
           signal: AbortSignal.timeout(15_000),
         })
+        if (allowMissing && response.status === 404) return { schemaVersion: 1, releases: [] }
         if (!response.ok) throw new Error(`${label} returned HTTP ${response.status}`)
         return await parse(response)
       } catch (error) {
@@ -654,44 +663,85 @@ export class RuntimeManager {
     throw stageError('check', `无法读取${label}`, attemptFailures.at(-1)?.error, { attemptFailures })
   }
 
-  async getLatestRelease() {
-    const [feed, metadata] = await Promise.all([
+  async getReleaseCatalog() {
+    const results = await Promise.allSettled([
       this.fetchOfficialResource(GITHUB_RELEASES_FEED_URL, {
-        accept: 'application/atom+xml',
-        label: 'DeepSeek 官方 GitHub Release',
-        parse: response => response.text(),
+        accept: 'application/atom+xml', label: 'DeepSeek 官方 GitHub Release',
+        parse: async response => {
+          const releases = parseRuntimeReleaseFeed(await response.text())
+          if (!releases.length) throw new Error('GitHub 发布清单为空或无法识别')
+          return releases
+        },
       }),
       this.fetchOfficialResource(RUNTIME_REGISTRY_URL, {
-        accept: 'application/vnd.npm.install-v1+json',
-        label: 'DeepSeek 官方 npm Registry',
-        parse: response => response.json(),
+        accept: 'application/vnd.npm.install-v1+json', label: 'DeepSeek 官方 npm Registry',
+        parse: async response => {
+          const metadata = await response.json()
+          if (!metadata?.versions || typeof metadata.versions !== 'object') throw new Error('npm 版本清单无效')
+          return metadata
+        },
       }),
+      this.channelUrl ? this.fetchOfficialResource(this.channelUrl, {
+        accept: 'application/json', label: '桌面版 Runtime 构建通道', allowMissing: true,
+        parse: response => response.json(),
+      }).then(manifest => parseRuntimeChannel(manifest, this)) : Promise.resolve([]),
     ])
-    const release = parseRuntimeReleaseFeed(feed)[0]
-    if (release === undefined) {
-      throw stageError('check', 'DeepSeek 官方 GitHub 尚未发布可识别的 Harness Release')
+    const labels = ['官方发布信息', '官方 npm', '源码构建通道']
+    const warnings = results.flatMap((result, index) => result.status === 'rejected' ? [`${labels[index]}暂时无法检查，请稍后重试。`] : [])
+    const releases = results[0].status === 'fulfilled' ? results[0].value : []
+    const metadata = results[1].status === 'fulfilled' ? results[1].value : undefined
+    const builds = results[2].status === 'fulfilled' ? results[2].value : []
+    const npm = Object.keys(metadata?.versions ?? {}).filter(version => runtimeVersionFromReleaseTag(version) === version)
+      .map(version => ({ ...releases.find(item => item.version === version), version, source: 'npm' }))
+    const candidates = [...npm, ...builds.map(build => ({ ...releases.find(item => item.version === build.version), ...build }))]
+      .sort((a, b) => compareRuntimeVersions(b.version, a.version)
+        || (a.source === b.source ? (b.build ?? 0) - (a.build ?? 0) : a.source === 'npm' ? -1 : 1))
+    const published = [...releases].sort((a, b) => compareRuntimeVersions(b.version, a.version))[0]
+    return { published, candidate: candidates[0], warnings,
+      checkComplete: results.every(result => result.status === 'fulfilled'),
+      latestNpmVersion: npm.sort((a, b) => compareRuntimeVersions(b.version, a.version))[0]?.version }
+  }
+
+  async getLatestRelease() {
+    const catalog = await this.getReleaseCatalog()
+    if (!catalog.candidate) throw stageError('check', '暂时没有可安装的 Harness Runtime', new Error(catalog.warnings.join(' ')))
+    return catalog.candidate
+  }
+
+  async getLocalStatus() {
+    const state = await this.getState()
+    let canRollback = false
+    if (state?.previousVersion && state.backupPath) {
+      try {
+        await access(state.backupPath)
+        canRollback = await this.isInstalledRuntimeReady(this.runtimeDirectory(state.previousVersion), state.previousVersion)
+      } catch { /* A missing backup must not hide the current version. */ }
     }
-    if (metadata?.versions?.[release.version] === undefined) {
-      throw stageError(
-        'check',
-        `DeepSeek 官方已发布 Harness ${release.version}，但对应 npm 安装包尚未发布，暂时无法安装`,
-      )
-    }
-    return release
+    return { activeVersion: state?.version, canRollback }
   }
 
   async checkForUpdate() {
-    const [activeVersion, latestRelease] = await Promise.all([
-      this.getActiveVersion(),
-      this.getLatestRelease(),
-    ])
-    const update = { activeVersion, ...describeUpdate(activeVersion, latestRelease.version) }
-    if (update.available && latestRelease.body) {
-      update.releaseNotes = {
-        title: latestRelease.title,
-        body: latestRelease.body,
-        url: latestRelease.url,
-      }
+    const [local, catalog] = await Promise.all([this.getLocalStatus(), this.getReleaseCatalog()])
+    const candidate = catalog.candidate
+    const update = { ...local, ...describeUpdate(local.activeVersion, candidate?.version),
+      latestPublishedVersion: catalog.published?.version, latestInstallableVersion: candidate?.version,
+      latestNpmVersion: catalog.latestNpmVersion, candidate, warnings: catalog.warnings, checkComplete: catalog.checkComplete }
+    const awaitingBuild = catalog.published && (!candidate || compareRuntimeVersions(catalog.published.version, candidate.version) > 0)
+    update.message = update.available
+      ? `可更新到 ${candidate.version}（${candidate.source === 'npm' ? '官方 npm' : '基于官方源码构建'}）。`
+      : catalog.checkComplete && candidate
+        ? '当前已是最新可安装版本。'
+        : '暂未发现可安装的新版本。'
+    if (awaitingBuild) update.message += ` 官方已发布 ${catalog.published.version}，对应安装包尚未就绪。`
+    if (catalog.warnings.length) {
+      if (!candidate && !catalog.published) update.message = '更新检查暂时不可用，请检查网络后重试。当前版本仍可继续使用。'
+      else update.message += ' 部分更新源暂时无法检查，当前结果可能不完整。'
+    }
+    if (update.available && candidate.body) update.releaseNotes = { title: candidate.title, body: candidate.body, url: candidate.url }
+    // Build download URLs are not release-note URLs.
+    if (update.available && candidate.source === 'source-build') update.releaseNotes = {
+      title: candidate.title ?? candidate.tag, body: candidate.body,
+      url: `https://github.com/deepseek-ai/deepseek-harness/releases/tag/${candidate.tag}`,
     }
     return update
   }
@@ -777,10 +827,100 @@ export class RuntimeManager {
     }
   }
 
-  async install(version) {
+  async cleanupRuntimeVersions({ expectedVersion, dryRun = false } = {}) {
+    const result = { retained: [], removed: [], deferred: [], reclaimedBytes: 0 }
+    try {
+      const state = await this.getState()
+      if (!state?.version || (expectedVersion && state.version !== expectedVersion)
+        || !await this.isInstalledRuntimeReady(this.runtimeDirectory(state.version), state.version)) return result
+      const keep = new Set([state.version, state.previousVersion].filter(Boolean))
+      result.retained = [...keep]
+      for (const entry of await readdir(this.versionsRoot, { withFileTypes: true })) {
+        if (!entry.isDirectory() || keep.has(entry.name)) continue
+        const version = runtimeVersionFromReleaseTag(entry.name)
+        const partial = entry.name.match(/^(.*)\.(?:installing|bundled)-\d+$/)
+        if (version !== entry.name && (!partial || runtimeVersionFromReleaseTag(partial[1]) !== partial[1])) continue
+        const directory = join(this.versionsRoot, entry.name)
+        try {
+          // Windows versions contain their own user home. Move it out before removing program files.
+          const home = join(directory, '.harness-home')
+          let homeExists = false
+          let homeIsDirectory = false
+          try {
+            const homeStat = await lstat(home)
+            homeExists = true
+            homeIsDirectory = homeStat.isDirectory()
+          } catch (error) { if (error.code !== 'ENOENT') throw error }
+          const bytes = await directorySize(directory) - (homeIsDirectory ? await directorySize(home) : 0)
+          if (!dryRun) {
+            if (homeExists) {
+              const preservedHome = join(this.root, 'backups', `${Date.now()}-${entry.name}-retired-home`)
+              await mkdir(dirname(preservedHome), { recursive: true })
+              await rename(home, preservedHome)
+            }
+            await removeRuntimePath(directory, { platform: this.platform })
+          }
+          result.removed.push(entry.name)
+          result.reclaimedBytes += Math.max(0, bytes)
+        } catch (error) {
+          result.deferred.push(entry.name)
+          this.logger.warn(`Runtime cleanup deferred for ${entry.name}: ${sanitizeRuntimeOutput(error.message)}`)
+        }
+      }
+    } catch (error) {
+      this.logger.warn(`Runtime cleanup deferred: ${sanitizeRuntimeOutput(error.message)}`)
+    }
+    return result
+  }
+
+  async installSourceRuntime(artifact, target) {
+    const stage = runtimeInstallDirectory(target, this.platform)
+    const archive = join(this.root, 'downloads', `${artifact.version}-${artifact.build}-${artifact.sha256}.tar.gz`)
+    try {
+      await downloadRuntimeArtifact(artifact, archive, { systemFetch: this.systemFetch, directFetch: this.directFetch,
+        onProgress: progress => this.reportProgress(progress) })
+      this.reportProgress({ phase: 'verify', title: '正在解压源码构建 Runtime', message: '安装包完整性校验通过，正在解压并检查运行能力', indeterminate: true })
+      await removeRuntimePath(stage, { platform: this.platform })
+      await extractRuntimeArchive(archive, stage)
+      await this.verifyRuntimeDirectory(stage, artifact.version)
+      await writeFile(join(stage, RUNTIME_READY_FILE), JSON.stringify({ version: artifact.version,
+        source: 'source-build', build: artifact.build, commit: artifact.commit, sha256: artifact.sha256 }) + '\n')
+      if (stage !== target) {
+        await removeRuntimePath(target, { platform: this.platform })
+        await rename(stage, target)
+      }
+      return target
+    } catch (error) {
+      await removeRuntimePath(stage, { platform: this.platform, required: false, logger: this.logger })
+      throw stageError('verify', `源码构建 Harness ${artifact.version} 安装失败`, error)
+    } finally {
+      await rm(archive, { force: true })
+    }
+  }
+
+  async verifyRuntimeDirectory(directory, version) {
+    await assertRuntimePackages(directory)
+    const verificationHome = join(directory, '.verification-home')
+    const entry = join(directory, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+    const options = { cwd: directory, env: this.runtimeEnvironment({ harnessHome: verificationHome, runtimeDirectory: directory }) }
+    try {
+      const result = await run(this.nodeBinary, this.runtimeNodeArgs([entry, '--version']), options)
+      if (result.stdout.trim() !== version) throw new Error('Runtime 版本与构建清单不一致')
+      const config = await run(this.nodeBinary, this.runtimeNodeArgs([entry, 'web', '--dump-default-config']), options)
+      assertRuntimeCapabilities(config.stdout)
+    } finally {
+      await rm(verificationHome, { recursive: true, force: true })
+    }
+  }
+
+  async install(version, candidate) {
     const safeVersion = assertSafeVersion(version)
     const target = this.runtimeDirectory(safeVersion)
     if (await this.isInstalledRuntimeReady(target, safeVersion)) return target
+    if (candidate?.source === 'source-build') {
+      if (candidate.version !== safeVersion || candidate.platform !== this.platform || candidate.arch !== this.arch) throw new Error('Runtime 构建包与目标版本或平台不匹配')
+      return this.installSourceRuntime(candidate, target)
+    }
     const bundledTarget = await this.installBundledRuntime(safeVersion, target)
     if (bundledTarget !== undefined) return bundledTarget
 
@@ -1057,15 +1197,25 @@ export class RuntimeManager {
     if (child.exitCode === null) terminateChild(child, { force: true })
   }
 
-  async updateAndRestart(version) {
+  async updateAndRestart(version, candidate) {
+    if (this.switching) throw new Error('另一个 Runtime 更新或回退正在进行')
+    this.switching = true
+    try { return await this.performUpdateAndRestart(version, candidate) } finally { this.switching = false }
+  }
+
+  async performUpdateAndRestart(version, candidate) {
     const previousState = await this.getState()
     const previous = previousState?.version
-    const backupPath = previous === undefined
-      ? undefined
-      : await this.backupHarnessHome(previous, `${previous}-to-${assertSafeVersion(version)}`)
-    await this.install(version)
-    if (previous !== undefined) await this.copyHarnessHome(previous, version)
+    if (previous && compareRuntimeVersions(version, previous) <= 0) throw new Error('更新目标必须高于当前版本；请使用回退恢复旧版本')
+    await this.install(version, candidate)
+    await this.assertCanSwitch()
+    await this.stop()
+    let backupPath
     try {
+      backupPath = previous === undefined
+        ? undefined
+        : await this.backupHarnessHome(previous, `${previous}-to-${assertSafeVersion(version)}`)
+      if (previous !== undefined) await this.copyHarnessHome(previous, version)
       let url
       let recoveryPath
       try {
@@ -1093,7 +1243,8 @@ export class RuntimeManager {
         }
       }
       await this.activate(version, { previousVersion: previous, backupPath })
-      return { version, url, previous, backupPath, recoveryPath }
+      const cleanup = await this.cleanupRuntimeVersions({ expectedVersion: version })
+      return { version, url, previous, backupPath, recoveryPath, cleanup }
     } catch (error) {
       await this.stop()
       if (this.platform === 'win32') {
@@ -1108,14 +1259,31 @@ export class RuntimeManager {
   }
 
   async rollback() {
+    if (this.switching) throw new Error('另一个 Runtime 更新或回退正在进行')
+    this.switching = true
+    try { return await this.performRollback() } finally { this.switching = false }
+  }
+
+  async performRollback() {
     const state = await this.getState()
     if (state?.previousVersion === undefined || state.backupPath === undefined) {
       throw new Error('No previous Harness update is available to roll back')
     }
+    await this.assertCanSwitch()
     await this.stop()
-    await this.restoreHarnessHome(state.previousVersion, state.backupPath)
-    const url = await this.start(state.previousVersion)
-    await this.activate(state.previousVersion)
-    return { version: state.previousVersion, url }
+    let preservedHome
+    try {
+      preservedHome = await this.backupHarnessHome(state.version, `${state.version}-before-rollback`)
+      await this.restoreHarnessHome(state.previousVersion, state.backupPath)
+      const url = await this.start(state.previousVersion)
+      await this.activate(state.previousVersion)
+      const cleanup = await this.cleanupRuntimeVersions({ expectedVersion: state.previousVersion })
+      return { version: state.previousVersion, url, preservedHome, cleanup }
+    } catch (error) {
+      await this.stop()
+      if (preservedHome) await this.restoreHarnessHome(state.version, preservedHome)
+      await this.start(state.version)
+      throw error
+    }
   }
 }

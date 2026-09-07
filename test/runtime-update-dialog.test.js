@@ -71,3 +71,10 @@ test('accepts only known runtime update dialog actions', () => {
   assert.equal(runtimeUpdateDialogAction('dsh-runtime-update://delete'), undefined)
   assert.equal(runtimeUpdateDialogAction('https://example.com/update'), undefined)
 })
+
+test('missing GitHub notes never refer to a link that is absent', () => {
+  const html = buildRuntimeUpdateDialogHtml({ version: '0.1.3-alpha.2', activeVersion: '0.1.2-rc.1', candidate: { source: 'npm' } })
+  assert.match(html, /暂未获取到该版本的 GitHub 更新说明/)
+  assert.doesNotMatch(html, /可以点击/)
+  assert.match(html, /来源：官方 npm/)
+})

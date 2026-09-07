@@ -1,4 +1,5 @@
 import { app, BrowserWindow, dialog, ipcMain, session, shell } from 'electron'
+import { assertRuntimeIdle } from './runtime-session-guard.js'
 import { randomUUID } from 'node:crypto'
 import { access } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -28,6 +29,7 @@ let runtime
 let desktopUpdater
 let visionCompatibility
 let shuttingDown = false
+let runtimeUpdateInProgress = false
 const recentImagePrompts = new Map()
 const visionFallbacks = new Set()
 const completedVisionFallbacks = new Set()
@@ -200,14 +202,11 @@ function installVisionPromptCapture() {
 function installDesktopUpdateIpc() {
   ipcMain.handle('desktop-harness:get-update-status', async event => {
     assertTrustedHarnessSender(event)
-    const state = await runtime.getState()
-    const latestVersion = await runtime.getLatestVersion()
-    return {
-      activeVersion: state?.version,
-      latestVersion,
-      available: state?.version !== latestVersion,
-      canRollback: state?.previousVersion !== undefined && state.backupPath !== undefined,
-    }
+    return runtime.checkForUpdate()
+  })
+  ipcMain.handle('desktop-harness:get-local-status', async event => {
+    assertTrustedHarnessSender(event)
+    return runtime.getLocalStatus()
   })
   ipcMain.handle('desktop-harness:check-for-updates', async event => {
     assertTrustedHarnessSender(event)
@@ -243,10 +242,10 @@ async function showSplash(message) {
   await mainWindow.loadFile(file, { query: { message } })
 }
 
-async function showUpdateProgress(version) {
+async function showUpdateProgress(version, source = 'npm') {
   const file = join(import.meta.dirname, 'update-progress.html')
   await access(file)
-  await mainWindow.loadFile(file, { query: { version } })
+  await mainWindow.loadFile(file, { query: { version, source } })
 }
 
 async function showDesktopUpdateProgress(version) {
@@ -397,6 +396,8 @@ async function startDesktopApplicationUpdate() {
 }
 
 async function checkForUpdates({ interactive = true } = {}) {
+  if (runtimeUpdateInProgress) return
+  runtimeUpdateInProgress = true
   let targetVersion
   try {
     const update = await runtime.checkForUpdate()
@@ -406,15 +407,16 @@ async function checkForUpdates({ interactive = true } = {}) {
         await dialog.showMessageBox(mainWindow, {
           type: 'info',
           title: 'Harness 更新',
-          message: `当前已是最新版 ${update.version}`,
+          message: update.message,
         })
       }
       return
     }
+    if (!interactive) return
     const action = await showRuntimeUpdateDialog(update)
     if (action !== 'update') return
-    await showUpdateProgress(update.version)
-    const installed = await runtime.updateAndRestart(update.version)
+    await showUpdateProgress(update.version, update.candidate?.source)
+    const installed = await runtime.updateAndRestart(update.version, update.candidate)
     await loadHarnessUrl(installed.url)
     await dialog.showMessageBox(mainWindow, {
       type: 'info',
@@ -422,6 +424,7 @@ async function checkForUpdates({ interactive = true } = {}) {
       message: `Harness 已更新到 ${installed.version}`,
     })
   } catch (error) {
+    if (!interactive) return
     const detail = formatUpdateFailure(error, targetVersion)
     await dialog.showMessageBox(mainWindow, {
       type: 'error',
@@ -431,6 +434,8 @@ async function checkForUpdates({ interactive = true } = {}) {
       buttons: ['返回 Harness'],
     })
     if (runtime?.currentUrl && !mainWindow.isDestroyed()) await loadHarnessUrl(runtime.currentUrl)
+  } finally {
+    runtimeUpdateInProgress = false
   }
 }
 
@@ -448,7 +453,7 @@ async function rollbackRuntime() {
     type: 'warning',
     title: '回退 Harness',
     message: `回退到 ${state.previousVersion}？`,
-    detail: '同时恢复更新前的会话与配置快照。',
+    detail: '会恢复更新前的会话与配置快照。升级后新增的会话和修改不会显示在旧版本中；回退前会另存当前数据备份。请先结束正在执行的任务。',
     buttons: ['回退并重启', '取消'],
     defaultId: 1,
     cancelId: 1,
@@ -492,6 +497,8 @@ async function boot() {
       mainWindow.webContents.send('desktop-harness:update-progress', progress)
     },
     bundledRuntime,
+    desktopVersion: app.getVersion(),
+    assertCanSwitch: () => assertRuntimeIdle(runtime.currentUrl, (input, init) => session.defaultSession.fetch(input, init)),
   })
   desktopUpdater = new DesktopUpdateManager({
     updater: autoUpdater,
@@ -543,8 +550,10 @@ async function boot() {
   } else {
     version = startupAction.version
     if (version === undefined) {
-      version = await runtime.getLatestVersion()
+      const candidate = await runtime.getLatestRelease()
+      version = candidate.version
       await showSplash(`首次安装 Harness ${version}，可能需要几分钟…`)
+      await runtime.install(version, candidate)
       await runtime.activate(version)
     } else if (startupAction.action === 'ensure-installed') {
       await showSplash(`正在校验内置 Harness ${version}…`)
@@ -553,6 +562,7 @@ async function boot() {
     url = await runtime.start(version)
   }
   await loadHarnessUrl(url)
+  if (!bundledUpgradeError) await runtime.cleanupRuntimeVersions({ expectedVersion: version })
   if (bundledUpgradeError !== undefined) {
     await dialog.showMessageBox(mainWindow, {
       type: 'warning',

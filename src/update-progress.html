@@ -40,7 +40,7 @@
           <h1 id="title">正在准备更新</h1>
         </div>
       </div>
-      <p class="message" id="message">正在连接官方 npm Registry…</p>
+      <p class="message" id="message">正在准备安装包…</p>
       <div class="bar" id="bar" role="progressbar" aria-label="更新进度"><span></span></div>
       <div class="metrics">
         <div class="metric"><div class="metric-label">网络线路</div><div class="metric-value" id="route">正在检测</div></div>
@@ -50,7 +50,11 @@
       <p class="notice" id="notice">依赖总大小由 npm 动态决定，因此进度条在下载阶段为活动状态；数据量与速度按安装目录实际写入估算。</p>
     </main>
     <script>
-      const targetVersion = new URLSearchParams(location.search).get('version')
+      const params = new URLSearchParams(location.search)
+      const targetVersion = params.get('version')
+      if (params.get('source') === 'source-build') {
+        document.querySelector('#notice').textContent = '下载进度按完整安装包计算。下载后会校验并解压，通过启动检查后再启用。'
+      }
       const title = document.querySelector('#title')
       const message = document.querySelector('#message')
       const route = document.querySelector('#route')

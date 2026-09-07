@@ -16,7 +16,9 @@ The packaged application checks the public GitHub release channel. Equal or olde
 
 ## Harness Runtime
 
-The desktop application follows the newest published entry in the official `deepseek-ai/deepseek-harness` GitHub Releases Atom feed, including releases marked as Pre-release. It confirms that the exact version exists as an official `@deepseek-ai/dsh` npm package before offering installation. A source-only GitHub Release is reported as published but not yet installable. The Runtime update uses the same GitHub entry for its release notes and source link; it never uses this repository's desktop release to represent an upstream Harness Runtime version.
+The desktop checks GitHub releases, npm, and the verified source-build channel independently. The highest installable version for the current platform is offered; a missing npm version or failed remote source does not erase local status. Official npm wins ties. Source-build archives are keyed by upstream version, build number, platform, and architecture, and must carry SHA-256, exact upstream tag/commit, minimum desktop version, and completed acceptance evidence.
+
+Use the commands and publication order in [RUNTIME-UPDATES.md](RUNTIME-UPDATES.md). Building creates an ineligible candidate. Verification and promotion prepare a local channel manifest; none of these commands commits, pushes, or publishes anything. Upload the immutable Runtime archive and acceptance report before updating `runtime-channel-v1/runtime-manifest.json`. Keep that channel release marked as pre-release so it does not become the desktop shell's Latest release. The first desktop supporting this channel is 0.1.14.
 
 ## Credentials and local data
 
