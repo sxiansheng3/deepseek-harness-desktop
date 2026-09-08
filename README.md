@@ -14,7 +14,7 @@ DeepSeek Harness Desktop is an Electron shell around the official, open-source D
 - Resolves the operating system proxy through Electron, retries network failures through a direct connection, and never changes system proxy settings.
 - Shows a dedicated update screen with the active network route, elapsed work, processed data, and an estimated download/extraction write rate.
 - Allows a Runtime installation to run for up to 100 minutes and reports the exact failed stage, attempted network routes, and underlying package-manager error.
-- Uses an independent GitHub release channel for the desktop shell. A compact upper-right badge is created only when a higher desktop version has actually been published.
+- Uses an independent GitHub release channel for the desktop shell. A compact upper-right badge is created only when a higher desktop version has actually been published, and the release channel is polled while the application runs so a newly published version appears in real time without quitting and reopening. The first check also runs shortly after startup so a pending update is surfaced quickly on the next launch.
 - Shows desktop-shell release notes before downloading, then reports exact percentage, transferred bytes, total bytes, download speed, and the active system-proxy/direct route.
 - Retries desktop-shell network failures through a direct connection without changing the operating system's proxy configuration.
 - Installs updates beside the active version, switches only after a successful start, and restarts the previous version after a failed start.
