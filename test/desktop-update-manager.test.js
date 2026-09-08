@@ -150,3 +150,89 @@ test('retains detailed failure reasons for system and direct desktop downloads',
   })
   assert.deepEqual(updater.proxyModes, ['system', 'system', 'system', 'direct', 'system'])
 })
+test('keeps an already-available update visible across a periodic re-check', async () => {
+  const update = { version: '0.1.7', releaseNotes: '实时更新提示' }
+  const updater = new FakeUpdater({ checks: [update, update] })
+  const statuses = []
+  const manager = new DesktopUpdateManager({
+    updater,
+    enabled: true,
+    onStatus: status => statuses.push(status),
+    logger: { warn() {} },
+  })
+  await manager.check()
+  assert.equal(manager.getStatus().available, true)
+  assert.equal(manager.getStatus().state, 'available')
+
+  await manager.check()
+  assert.equal(manager.getStatus().available, true)
+  assert.equal(manager.getStatus().update.version, '0.1.7')
+  // the badge never flickers: only the first check emitted a transient 'checking' state
+  assert.equal(statuses.filter(value => value.state === 'checking').length, 1)
+})
+
+test('a failed periodic re-check does not hide an already-known update', async () => {
+  const update = { version: '0.1.7' }
+  const updater = new FakeUpdater({
+    checks: [update, new Error('net::ERR_INTERNET_DISCONNECTED'), new Error('net::ERR_NAME_NOT_RESOLVED')],
+  })
+  const manager = new DesktopUpdateManager({ updater, enabled: true, logger: { warn() {} } })
+  await manager.check()
+  assert.equal(manager.getStatus().available, true)
+
+  await manager.check()
+  assert.equal(manager.getStatus().available, true)
+  assert.equal(manager.getStatus().update.version, '0.1.7')
+})
+
+test('clears the update when the remote channel no longer offers it', async () => {
+  const update = { version: '0.1.7' }
+  const updater = new FakeUpdater({ checks: [update, null] })
+  const manager = new DesktopUpdateManager({ updater, enabled: true, logger: { warn() {} } })
+  await manager.check()
+  assert.equal(manager.getStatus().available, true)
+
+  await manager.check()
+  assert.equal(manager.getStatus().available, false)
+  assert.equal(manager.getStatus().state, 'idle')
+})
+
+test('keeps the downloaded state when a periodic re-check reports the same update', async () => {
+  const update = { version: '0.1.7' }
+  const updater = new FakeUpdater({ checks: [update, update], downloads: [update] })
+  const manager = new DesktopUpdateManager({ updater, enabled: true, logger: { warn() {} } })
+  await manager.check()
+  await manager.download()
+  assert.equal(manager.getStatus().state, 'downloaded')
+
+  await manager.check()
+  assert.equal(manager.getStatus().state, 'downloaded')
+  assert.equal(manager.getStatus().available, true)
+})
+
+test('skips a periodic re-check while a check is already in flight', async () => {
+  const update = { version: '0.1.7' }
+  const updater = new FakeUpdater({ checks: [update] })
+  const originalCheckForUpdates = updater.checkForUpdates.bind(updater)
+  let concurrent = 0
+  let maxConcurrent = 0
+  let openGate
+  const gate = new Promise(resolve => { openGate = resolve })
+  updater.checkForUpdates = async () => {
+    concurrent += 1
+    maxConcurrent = Math.max(maxConcurrent, concurrent)
+    try {
+      await gate
+      return await originalCheckForUpdates()
+    } finally {
+      concurrent -= 1
+    }
+  }
+  const manager = new DesktopUpdateManager({ updater, enabled: true, logger: { warn() {} } })
+  const first = manager.check()
+  const second = manager.check()
+  openGate()
+  await Promise.all([first, second])
+  assert.equal(maxConcurrent, 1)
+})
+

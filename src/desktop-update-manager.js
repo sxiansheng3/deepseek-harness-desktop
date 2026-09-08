@@ -65,9 +65,15 @@ export class DesktopUpdateManager {
 
     updater.autoDownload = false
     updater.autoInstallOnAppQuit = false
-    updater.on('checking-for-update', () => this.setStatus({ available: false, state: 'checking' }))
+    updater.on('checking-for-update', () => {
+      if (this.status.available) return
+      this.setStatus({ available: false, state: 'checking' })
+    })
     updater.on('update-available', info => {
-      this.setStatus({ available: true, state: 'available', update: publicUpdateInfo(info) })
+      const update = publicUpdateInfo(info)
+      const sameUpdate = update?.version !== undefined && update.version === this.status.update?.version
+      if (sameUpdate && this.status.state === 'downloaded') return
+      this.setStatus({ available: true, state: 'available', update })
     })
     updater.on('update-not-available', () => this.setStatus({ available: false, state: 'idle' }))
     updater.on('download-progress', progress => {
@@ -116,6 +122,8 @@ export class DesktopUpdateManager {
 
   async check() {
     if (!this.enabled) return this.status
+    if (this.checkInFlight || this.status.state === 'downloading') return this.status
+    this.checkInFlight = true
     const routes = [
       { kind: 'system', label: '系统网络（含代理）' },
       { kind: 'direct', label: '直接连接' },
@@ -131,8 +139,9 @@ export class DesktopUpdateManager {
           if (index === routes.length - 1 || !isDesktopUpdateNetworkFailure(error)) break
         }
       }
-      this.setStatus({ available: false, state: 'idle' })
+      if (!this.status.available) this.setStatus({ available: false, state: 'idle' })
     } finally {
+      this.checkInFlight = false
       await this.restoreSystemNetwork()
     }
     return this.status

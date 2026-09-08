@@ -24,6 +24,11 @@ import electronUpdater from 'electron-updater'
 const { autoUpdater } = electronUpdater
 
 const APP_NAME = 'DeepSeek Harness Desktop'
+// Desktop shell update polling: a quick first check right after startup, then keep
+// watching the release channel so a newly published version shows the badge in
+// real time without requiring the user to quit and reopen the application.
+const DESKTOP_UPDATE_FIRST_CHECK_DELAY_MS = 3_000
+const DESKTOP_UPDATE_POLL_INTERVAL_MS = Number(process.env.DSH_DESKTOP_UPDATE_POLL_MS) || 5 * 60_000
 let mainWindow
 let runtime
 let desktopUpdater
@@ -573,7 +578,8 @@ async function boot() {
     })
   }
   setTimeout(() => { void checkForUpdates({ interactive: false }) }, 10_000)
-  setTimeout(() => { void desktopUpdater.check() }, 20_000)
+  setTimeout(() => { void desktopUpdater.check() }, DESKTOP_UPDATE_FIRST_CHECK_DELAY_MS)
+  setInterval(() => { void desktopUpdater.check() }, DESKTOP_UPDATE_POLL_INTERVAL_MS)
 }
 
 if (!app.requestSingleInstanceLock()) {
