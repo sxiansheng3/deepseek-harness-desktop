@@ -10,7 +10,7 @@ import {
 } from './runtime-manager.js'
 import { bundledRuntimeStartupAction, loadBundledRuntime } from './bundled-runtime.js'
 import { DesktopUpdateManager } from './desktop-update-manager.js'
-import { buildRuntimeUpdateDialogHtml, runtimeUpdateDialogAction } from './runtime-update-dialog.js'
+import { buildRuntimeUpdateDialogHtml, chineseReleaseNotes, runtimeUpdateDialogAction } from './runtime-update-dialog.js'
 import { isHiddenAcceptance, loadLocalRuntimeUrl } from './local-runtime-loader.js'
 import { installApplicationMenu } from './menu.js'
 import { bundledToolDirectory, bundledToolPath } from './tool-layout.js'
@@ -29,12 +29,19 @@ const APP_NAME = 'DeepSeek Harness Desktop'
 // real time without requiring the user to quit and reopen the application.
 const DESKTOP_UPDATE_FIRST_CHECK_DELAY_MS = 3_000
 const DESKTOP_UPDATE_POLL_INTERVAL_MS = Number(process.env.DSH_DESKTOP_UPDATE_POLL_MS) || 5 * 60_000
+// Harness Runtime update polling: keep watching the release channel while the app
+// is running so a newly published runtime also surfaces without a manual check.
+const HARNESS_UPDATE_FIRST_CHECK_DELAY_MS = 10_000
+const HARNESS_UPDATE_POLL_INTERVAL_MS = Number(process.env.DSH_HARNESS_UPDATE_POLL_MS) || 5 * 60_000
 let mainWindow
 let runtime
 let desktopUpdater
 let visionCompatibility
 let shuttingDown = false
 let runtimeUpdateInProgress = false
+let promptedHarnessVersion
+let promptedDesktopVersion
+let updatePromptOpen = false
 const recentImagePrompts = new Map()
 const visionFallbacks = new Set()
 const completedVisionFallbacks = new Set()
@@ -352,20 +359,22 @@ async function showRuntimeUpdateDialog(update) {
   })
 }
 
-async function startDesktopApplicationUpdate() {
+async function startDesktopApplicationUpdate({ skipConfirmation = false } = {}) {
   const status = desktopUpdater.getStatus()
   if (!status.available || !status.update?.version) return
-  const releaseNotes = status.update.releaseNotes?.trim()
-  const confirmation = await dialog.showMessageBox(mainWindow, {
-    type: 'info',
-    title: 'DeepSeek Harness Desktop 更新',
-    message: `桌面版 ${status.update.version} 可以更新`,
-    detail: `这是桌面应用自身更新，不是 Harness Runtime 更新。${releaseNotes ? `\n\n更新内容：\n${releaseNotes.slice(0, 8_000)}` : ''}`,
-    buttons: [status.state === 'downloaded' ? '重启并安装' : '下载更新', '稍后'],
-    defaultId: 0,
-    cancelId: 1,
-  })
-  if (confirmation.response !== 0) return
+  if (!skipConfirmation) {
+    const releaseNotes = status.update.releaseNotes?.trim()
+    const confirmation = await dialog.showMessageBox(mainWindow, {
+      type: 'info',
+      title: 'DeepSeek Harness Desktop 更新',
+      message: `桌面版 ${status.update.version} 可以更新`,
+      detail: `这是桌面应用自身更新，不是 Harness Runtime 更新。${releaseNotes ? `\n\n更新内容：\n${releaseNotes.slice(0, 8_000)}` : ''}`,
+      buttons: [status.state === 'downloaded' ? '重启并安装' : '下载更新', '稍后'],
+      defaultId: 0,
+      cancelId: 1,
+    })
+    if (confirmation.response !== 0) return
+  }
 
   try {
     if (status.state !== 'downloaded') {
@@ -400,7 +409,7 @@ async function startDesktopApplicationUpdate() {
   }
 }
 
-async function checkForUpdates({ interactive = true } = {}) {
+async function checkForUpdates({ interactive = true, notify = false } = {}) {
   if (runtimeUpdateInProgress) return
   runtimeUpdateInProgress = true
   let targetVersion
@@ -408,6 +417,7 @@ async function checkForUpdates({ interactive = true } = {}) {
     const update = await runtime.checkForUpdate()
     targetVersion = update.version
     if (!update.available) {
+      promptedHarnessVersion = undefined
       if (interactive) {
         await dialog.showMessageBox(mainWindow, {
           type: 'info',
@@ -417,17 +427,20 @@ async function checkForUpdates({ interactive = true } = {}) {
       }
       return
     }
-    if (!interactive) return
+    if (!interactive) {
+      if (!notify || update.version === promptedHarnessVersion) return
+      const activeVersion = update.activeVersion === undefined ? '' : '\n当前 Harness Runtime 版本：' + update.activeVersion
+      const shown = await promptAvailableUpdate({
+        version: update.version,
+        detail: activeVersion + '\n更新后 Harness Runtime 会自动重启，进行中的任务会中断。' + harnessUpdateNotes(update),
+        apply: () => installHarnessUpdate(update),
+      })
+      if (shown) promptedHarnessVersion = update.version
+      return
+    }
     const action = await showRuntimeUpdateDialog(update)
     if (action !== 'update') return
-    await showUpdateProgress(update.version, update.candidate?.source)
-    const installed = await runtime.updateAndRestart(update.version, update.candidate)
-    await loadHarnessUrl(installed.url)
-    await dialog.showMessageBox(mainWindow, {
-      type: 'info',
-      title: '更新完成',
-      message: `Harness 已更新到 ${installed.version}`,
-    })
+    await installHarnessUpdate(update)
   } catch (error) {
     if (!interactive) return
     const detail = formatUpdateFailure(error, targetVersion)
@@ -442,6 +455,74 @@ async function checkForUpdates({ interactive = true } = {}) {
   } finally {
     runtimeUpdateInProgress = false
   }
+}
+
+// 桌面应用自身的主动提示：轮询发现 GitHub Release 有新版本时立刻询问用户。
+async function noticeDesktopUpdate(status) {
+  if (status?.state !== 'available') return
+  const version = status.update?.version
+  if (typeof version !== 'string' || version === '' || version === promptedDesktopVersion) return
+  if (runtimeUpdateInProgress || updatePromptOpen) return
+  const releaseNotes = typeof status.update?.releaseNotes === 'string' ? status.update.releaseNotes.trim() : ''
+  const shown = await promptAvailableUpdate({
+    version,
+    detail: '这是桌面应用自身更新（不是 Harness Runtime），下载完成后需要重启应用来安装。'
+      + (releaseNotes === '' ? '' : '\n\n更新内容：\n' + releaseNotes.slice(0, 4_000)),
+    apply: () => startDesktopApplicationUpdate({ skipConfirmation: true }),
+  })
+  if (shown) promptedDesktopVersion = version
+}
+
+function harnessUpdateNotes(update) {
+  const body = typeof update?.releaseNotes?.body === 'string' ? update.releaseNotes.body.trim() : ''
+  if (body === '') return ''
+  return '\n\n更新说明：\n' + chineseReleaseNotes(body).slice(0, 4_000)
+}
+
+// 主动更新提示：启动时和运行期间只要检测到新版本就询问用户，点“立即更新”立刻开始更新。
+async function promptAvailableUpdate({ version, detail, apply }) {
+  if (updatePromptOpen) return false
+  if (mainWindow === undefined || mainWindow.isDestroyed()) return false
+  updatePromptOpen = true
+  try {
+    const confirmation = await dialog.showMessageBox(mainWindow, {
+      type: 'info',
+      title: 'DeepSeek Harness 更新',
+      message: '发现 DeepSeek Harness 新版本，是否要更新？',
+      detail: '新版本：' + version + detail,
+      buttons: ['立即更新', '稍后'],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true,
+    })
+    if (confirmation.response !== 0) return true
+    try {
+      await apply()
+    } catch (error) {
+      await dialog.showMessageBox(mainWindow, {
+        type: 'error',
+        title: 'DeepSeek Harness 更新失败',
+        message: '更新没有完成，已保留或恢复原来的可用版本。',
+        detail: formatUpdateFailure(error, version),
+        buttons: ['返回 Harness'],
+      })
+      if (runtime?.currentUrl && !mainWindow.isDestroyed()) await loadHarnessUrl(runtime.currentUrl)
+    }
+    return true
+  } finally {
+    updatePromptOpen = false
+  }
+}
+
+async function installHarnessUpdate(update) {
+  await showUpdateProgress(update.version, update.candidate?.source)
+  const installed = await runtime.updateAndRestart(update.version, update.candidate)
+  await loadHarnessUrl(installed.url)
+  await dialog.showMessageBox(mainWindow, {
+    type: 'info',
+    title: '更新完成',
+    message: 'Harness 已更新到 ' + installed.version,
+  })
 }
 
 async function rollbackRuntime() {
@@ -511,6 +592,7 @@ async function boot() {
     onStatus: status => {
       if (mainWindow === undefined || mainWindow.isDestroyed()) return
       mainWindow.webContents.send('desktop-shell:update-status', status)
+      if (status?.state === 'available') void noticeDesktopUpdate(status)
     },
   })
   await runtime.initialize()
@@ -577,7 +659,14 @@ async function boot() {
       buttons: ['继续使用'],
     })
   }
-  setTimeout(() => { void checkForUpdates({ interactive: false }) }, 10_000)
+  setTimeout(
+    () => { void checkForUpdates({ interactive: false, notify: true }) },
+    HARNESS_UPDATE_FIRST_CHECK_DELAY_MS,
+  )
+  setInterval(
+    () => { void checkForUpdates({ interactive: false, notify: true }) },
+    HARNESS_UPDATE_POLL_INTERVAL_MS,
+  )
   setTimeout(() => { void desktopUpdater.check() }, DESKTOP_UPDATE_FIRST_CHECK_DELAY_MS)
   setInterval(() => { void desktopUpdater.check() }, DESKTOP_UPDATE_POLL_INTERVAL_MS)
 }
