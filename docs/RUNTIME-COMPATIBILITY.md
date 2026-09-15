@@ -68,7 +68,7 @@ and plugin continuity, then rolls back and verifies both restored old data and
 preserved post-upgrade data. It writes `acceptance-report.json` and exits nonzero
 on failure. No real user home is copied.
 
-Desktop 0.1.17 validation: 89 tests passed; a real `0.1.5-rc.2` to
+Desktop 0.1.17 validation: 91 tests passed; a real `0.1.5-rc.2` to
 `0.1.6-alpha.1` npm upgrade, session continuity, test plugin loading and rollback
 passed. The installer bundles Runtime `0.1.6-alpha.1`. Packaged desktop UI,
 signature/notarization and public online-update evidence are recorded separately
@@ -92,3 +92,13 @@ Both were scrolled to the last entry; Later, Close and Return Harness were click
 The small error footer ended at y=355.11 within the 356-pixel viewport. Browser
 console warnings/errors were empty. These were isolated layout fixtures; packaged
 application action routing is checked separately before release.
+
+## Bundled native dependencies
+
+The 0.1.6-alpha.1 archive introduced unsigned native dependencies that the previous
+outer-App signing step did not discover. Apple rejected the first notarization.
+The macOS packaging hook now verifies the original archive hash, scans all nested
+files by Mach-O content, signs and verifies each with Developer ID, timestamp and
+hardened runtime, and rebuilds the packaged archive/hash before App signing.
+No fixed dependency or executable names are required; vendor inputs stay unchanged.
+The signing report and Apple result remain separate release evidence.

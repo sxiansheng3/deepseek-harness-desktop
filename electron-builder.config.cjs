@@ -3,6 +3,7 @@ const notarizationEnabled = Boolean(process.env.APPLE_KEYCHAIN_PROFILE?.trim())
 const bundledRuntime = require('./resources/bundled-runtime.json')
 
 module.exports = {
+  afterPack: async (context) => (await import('./scripts/sign-bundled-runtime.mjs')).default(context),
   appId: 'com.songtao.deepseek-harness-desktop',
   productName: 'DeepSeek Harness Desktop',
   copyright: 'Copyright © 2026 tao song. DeepSeek is a trademark of its respective owner.',
