@@ -126,6 +126,7 @@ export function buildRuntimeUpdateDialogHtml(update) {
       align-items: center;
       justify-content: flex-end;
       gap: 10px;
+      flex-wrap: wrap;
       padding: 16px 22px;
       border-top: 1px solid #dce3ec;
       background: #f8fafc;
@@ -145,6 +146,15 @@ export function buildRuntimeUpdateDialogHtml(update) {
     .primary { border: 1px solid #2563eb; color: #fff; background: #2563eb; }
     .primary:hover { border-color: #1d4ed8; background: #1d4ed8; }
     a:focus-visible { outline: 3px solid rgba(37, 99, 235, 0.28); outline-offset: 2px; }
+    @media (max-height: 480px), (max-width: 540px) {
+      header { padding: 14px 56px 12px 16px; }
+      h1 { font-size: 17px; }
+      .summary { font-size: 12px; margin-top: 6px; }
+      .notes { padding: 14px 16px; }
+      footer { padding: 12px; gap: 8px; }
+      .button { min-width: 0; padding: 8px 10px; font-size: 12px; }
+      .close { top: 10px; right: 10px; }
+    }
     @media (prefers-color-scheme: dark) {
       :root, body, .dialog { color: #edf3fa; background: #161a21; }
       .dialog { border-color: #343c49; }

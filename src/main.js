@@ -1,4 +1,5 @@
-import { app, BrowserWindow, dialog, ipcMain, session, shell } from 'electron'
+import { app, BrowserWindow, ipcMain, screen, session, shell } from 'electron'
+import { desktopDialogBounds, showDesktopDialog } from './desktop-dialog.js'
 import { assertRuntimeIdle } from './runtime-session-guard.js'
 import { randomUUID } from 'node:crypto'
 import { access } from 'node:fs/promises'
@@ -22,6 +23,7 @@ import {
 import electronUpdater from 'electron-updater'
 
 const { autoUpdater } = electronUpdater
+const showMessageDialog = (...args) => showDesktopDialog({ BrowserWindow, screen }, ...args)
 
 const APP_NAME = 'DeepSeek Harness Desktop'
 // Desktop shell update polling: a quick first check right after startup, then keep
@@ -297,15 +299,12 @@ function formatUpdateFailure(error, version) {
 }
 
 async function showRuntimeUpdateDialog(update) {
-  const parentBounds = mainWindow.getContentBounds()
-  const width = Math.min(680, Math.max(520, parentBounds.width - 80))
-  const height = Math.min(720, Math.max(480, parentBounds.height - 80))
+  const parentBounds = mainWindow.getBounds()
+  const workArea = screen.getDisplayMatching(parentBounds).workArea
   const updateWindow = new BrowserWindow({
     parent: mainWindow,
     modal: true,
-    width,
-    height,
-    useContentSize: true,
+    ...desktopDialogBounds(parentBounds, workArea, { height: 720 }),
     resizable: false,
     minimizable: false,
     maximizable: false,
@@ -364,11 +363,11 @@ async function startDesktopApplicationUpdate({ skipConfirmation = false } = {}) 
   if (!status.available || !status.update?.version) return
   if (!skipConfirmation) {
     const releaseNotes = status.update.releaseNotes?.trim()
-    const confirmation = await dialog.showMessageBox(mainWindow, {
+    const confirmation = await showMessageDialog(mainWindow, {
       type: 'info',
       title: 'DeepSeek Harness Desktop 更新',
       message: `桌面版 ${status.update.version} 可以更新`,
-      detail: `这是桌面应用自身更新，不是 Harness Runtime 更新。${releaseNotes ? `\n\n更新内容：\n${releaseNotes.slice(0, 8_000)}` : ''}`,
+      detail: `这是桌面应用自身更新，不是 Harness Runtime 更新。${releaseNotes ? `\n\n更新内容：\n${releaseNotes}` : ''}`,
       buttons: [status.state === 'downloaded' ? '重启并安装' : '下载更新', '稍后'],
       defaultId: 0,
       cancelId: 1,
@@ -381,7 +380,7 @@ async function startDesktopApplicationUpdate({ skipConfirmation = false } = {}) 
       await showDesktopUpdateProgress(status.update.version)
       await desktopUpdater.download()
     }
-    const install = await dialog.showMessageBox(mainWindow, {
+    const install = await showMessageDialog(mainWindow, {
       type: 'info',
       title: '桌面版更新已下载',
       message: `DeepSeek Harness Desktop ${status.update.version} 已准备好`,
@@ -398,7 +397,7 @@ async function startDesktopApplicationUpdate({ skipConfirmation = false } = {}) 
     shuttingDown = true
     desktopUpdater.quitAndInstall()
   } catch (error) {
-    await dialog.showMessageBox(mainWindow, {
+    await showMessageDialog(mainWindow, {
       type: 'error',
       title: '桌面版更新失败',
       message: '桌面版安装包没有下载完成，当前版本未被替换。',
@@ -419,7 +418,7 @@ async function checkForUpdates({ interactive = true, notify = false } = {}) {
     if (!update.available) {
       promptedHarnessVersion = undefined
       if (interactive) {
-        await dialog.showMessageBox(mainWindow, {
+        await showMessageDialog(mainWindow, {
           type: 'info',
           title: 'Harness 更新',
           message: update.message,
@@ -432,7 +431,7 @@ async function checkForUpdates({ interactive = true, notify = false } = {}) {
       const activeVersion = update.activeVersion === undefined ? '' : '\n当前 Harness Runtime 版本：' + update.activeVersion
       const shown = await promptAvailableUpdate({
         version: update.version,
-        detail: activeVersion + '\n更新后 Harness Runtime 会自动重启，进行中的任务会中断。' + harnessUpdateNotes(update),
+        detail: activeVersion + '\n请等待任务结束后更新；更新失败时会恢复原来的可用版本。' + harnessUpdateNotes(update),
         apply: () => installHarnessUpdate(update),
       })
       if (shown) promptedHarnessVersion = update.version
@@ -444,7 +443,7 @@ async function checkForUpdates({ interactive = true, notify = false } = {}) {
   } catch (error) {
     if (!interactive) return
     const detail = formatUpdateFailure(error, targetVersion)
-    await dialog.showMessageBox(mainWindow, {
+    await showMessageDialog(mainWindow, {
       type: 'error',
       title: 'Harness 更新失败',
       message: '更新没有完成，已保留或恢复原来的可用版本。',
@@ -467,7 +466,7 @@ async function noticeDesktopUpdate(status) {
   const shown = await promptAvailableUpdate({
     version,
     detail: '这是桌面应用自身更新（不是 Harness Runtime），下载完成后需要重启应用来安装。'
-      + (releaseNotes === '' ? '' : '\n\n更新内容：\n' + releaseNotes.slice(0, 4_000)),
+      + (releaseNotes === '' ? '' : '\n\n更新内容：\n' + releaseNotes),
     apply: () => startDesktopApplicationUpdate({ skipConfirmation: true }),
   })
   if (shown) promptedDesktopVersion = version
@@ -476,7 +475,7 @@ async function noticeDesktopUpdate(status) {
 function harnessUpdateNotes(update) {
   const body = typeof update?.releaseNotes?.body === 'string' ? update.releaseNotes.body.trim() : ''
   if (body === '') return ''
-  return '\n\n更新说明：\n' + chineseReleaseNotes(body).slice(0, 4_000)
+  return '\n\n更新说明：\n' + chineseReleaseNotes(body)
 }
 
 // 主动更新提示：启动时和运行期间只要检测到新版本就询问用户，点“立即更新”立刻开始更新。
@@ -485,7 +484,7 @@ async function promptAvailableUpdate({ version, detail, apply }) {
   if (mainWindow === undefined || mainWindow.isDestroyed()) return false
   updatePromptOpen = true
   try {
-    const confirmation = await dialog.showMessageBox(mainWindow, {
+    const confirmation = await showMessageDialog(mainWindow, {
       type: 'info',
       title: 'DeepSeek Harness 更新',
       message: '发现 DeepSeek Harness 新版本，是否要更新？',
@@ -499,7 +498,7 @@ async function promptAvailableUpdate({ version, detail, apply }) {
     try {
       await apply()
     } catch (error) {
-      await dialog.showMessageBox(mainWindow, {
+      await showMessageDialog(mainWindow, {
         type: 'error',
         title: 'DeepSeek Harness 更新失败',
         message: '更新没有完成，已保留或恢复原来的可用版本。',
@@ -518,7 +517,7 @@ async function installHarnessUpdate(update) {
   await showUpdateProgress(update.version, update.candidate?.source)
   const installed = await runtime.updateAndRestart(update.version, update.candidate)
   await loadHarnessUrl(installed.url)
-  await dialog.showMessageBox(mainWindow, {
+  await showMessageDialog(mainWindow, {
     type: 'info',
     title: '更新完成',
     message: 'Harness 已更新到 ' + installed.version,
@@ -528,14 +527,14 @@ async function installHarnessUpdate(update) {
 async function rollbackRuntime() {
   const state = await runtime.getState()
   if (state?.previousVersion === undefined || state.backupPath === undefined) {
-    await dialog.showMessageBox(mainWindow, {
+    await showMessageDialog(mainWindow, {
       type: 'info',
       title: 'Harness 回退',
       message: '当前没有可回退的 Harness 更新。',
     })
     return
   }
-  const confirmation = await dialog.showMessageBox(mainWindow, {
+  const confirmation = await showMessageDialog(mainWindow, {
     type: 'warning',
     title: '回退 Harness',
     message: `回退到 ${state.previousVersion}？`,
@@ -550,7 +549,7 @@ async function rollbackRuntime() {
     const result = await runtime.rollback()
     await loadHarnessUrl(result.url)
   } catch (error) {
-    await dialog.showMessageBox(mainWindow, {
+    await showMessageDialog(mainWindow, {
       type: 'error',
       title: 'Harness 回退失败',
       message: '无法恢复上一个 Harness 版本。',
@@ -651,7 +650,7 @@ async function boot() {
   await loadHarnessUrl(url)
   if (!bundledUpgradeError) await runtime.cleanupRuntimeVersions({ expectedVersion: version })
   if (bundledUpgradeError !== undefined) {
-    await dialog.showMessageBox(mainWindow, {
+    await showMessageDialog(mainWindow, {
       type: 'warning',
       title: '已恢复原 Harness Runtime',
       message: '安装包内置 Runtime 未能启动，已继续使用原来的可用版本。',
@@ -695,7 +694,7 @@ if (!app.requestSingleInstanceLock()) {
       app.exit(1)
       return
     }
-    const result = await dialog.showMessageBox({
+    const result = await showMessageDialog({
       type: 'error',
       title: '无法启动 DeepSeek Harness Desktop',
       message: 'Harness Runtime 未能启动',

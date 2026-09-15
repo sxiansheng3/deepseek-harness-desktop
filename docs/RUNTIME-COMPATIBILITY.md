@@ -68,8 +68,27 @@ and plugin continuity, then rolls back and verifies both restored old data and
 preserved post-upgrade data. It writes `acceptance-report.json` and exits nonzero
 on failure. No real user home is copied.
 
-Desktop 0.1.17 validation: 85 tests passed; a real `0.1.5-rc.2` to
+Desktop 0.1.17 validation: 89 tests passed; a real `0.1.5-rc.2` to
 `0.1.6-alpha.1` npm upgrade, session continuity, test plugin loading and rollback
 passed. The installer bundles Runtime `0.1.6-alpha.1`. Packaged desktop UI,
 signature/notarization and public online-update evidence are recorded separately
 under `dist/release-evidence/0.1.17/`.
+
+## Long update and error dialogs
+
+The same task included a user screenshot showing an automatic update prompt taller
+than the display, with unreachable actions. The manual Runtime dialog was already
+scrollable, but automatic prompts, desktop update confirmation and failure/startup
+messages still used native `showMessageBox` with long `detail` text.
+
+All desktop update/error/startup messages now use `showDesktopDialog`: fixed header
+and footer, separately scrollable message/details, word wrapping for long paths,
+Escape/close mapped to cancel, and bounds clamped to the current display work area.
+The manual Runtime dialog uses the same display-bound calculation and compact CSS
+for small windows. Release notes no longer need character truncation to fit.
+
+Rendered tests used the production HTML at 680 x 620 and 488 x 356, with 100 entries.
+Both were scrolled to the last entry; Later, Close and Return Harness were clicked.
+The small error footer ended at y=355.11 within the 356-pixel viewport. Browser
+console warnings/errors were empty. These were isolated layout fixtures; packaged
+application action routing is checked separately before release.

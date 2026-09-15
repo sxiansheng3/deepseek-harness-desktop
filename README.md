@@ -10,7 +10,7 @@ DeepSeek Harness Desktop is an Electron shell around the official, open-source D
 - Checks official GitHub releases, npm packages, and verified source-built Runtime artifacts independently; offers only a higher, installable version for this platform.
 - Ships the complete current macOS arm64 Harness Runtime inside the signed desktop application. A clean installation copies and verifies that bundled Runtime locally, so first launch does not depend on npm or GitHub being reachable.
 - Prefers official npm for equal versions and supports verified builds of fixed official release tags when npm publication lags. Local version, rollback availability, and image compatibility remain readable when remote checks fail.
-- Shows the Chinese section of bilingual Runtime release notes in a fixed-height, scrollable dialog whose close and update controls remain visible.
+- Shows update confirmations and errors in display-bounded windows with independently scrollable text and always-visible close/footer controls. The manual Runtime release dialog shows the Chinese section of bilingual release notes.
 - Resolves the operating system proxy through Electron, retries network failures through a direct connection, and never changes system proxy settings.
 - Shows a dedicated update screen with the active network route, elapsed work, processed data, and an estimated download/extraction write rate.
 - Allows a Runtime installation to run for up to 100 minutes and reports the exact failed stage, attempted network routes, and underlying package-manager error.
