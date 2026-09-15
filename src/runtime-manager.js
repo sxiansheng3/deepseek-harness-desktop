@@ -4,6 +4,7 @@ import { createReadStream } from 'node:fs'
 import { createServer } from 'node:net'
 import { access, cp, lstat, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
+import { assertRuntimeCapabilities, assertRuntimePackages, assertRuntimeWebReady, resolveRuntimeEntry } from './runtime-validation.js'
 import { RUNTIME_CHANNEL_URL, parseRuntimeChannel, downloadRuntimeArtifact, extractRuntimeArchive } from './runtime-artifacts.js'
 
 const PACKAGE_NAME = '@deepseek-ai/dsh'
@@ -382,66 +383,8 @@ export async function removeRuntimePath(path, {
   }
 }
 
-export const REQUIRED_WEB_CAPABILITIES = [
-  'code-runtime',
-  'goal',
-  'llm-deepseek',
-  'permission',
-  'plan-mode',
-  'plugin-inventory',
-  'session-persistence-jsonl',
-  'skill-filesystem',
-  'subagent-spawn-in-process',
-  'tool-bash',
-  'tool-fs',
-  'tool-pwsh',
-  'tool-skill',
-  'tool-subagent',
-  'tool-web',
-  'tool-workflow',
-  'web-runtime',
-]
-
-export const REQUIRED_RUNTIME_PACKAGES = [
-  'dsh-headless',
-  'dsh-mcp-client',
-  'dsh-pwsh-local',
-  'dsh-pwsh-sandbox',
-  'dsh-sandbox-windows-acl',
-  'dsh-skill-filesystem',
-  'dsh-subagent-spawn-in-process',
-  'dsh-terminal-bash',
-  'dsh-tool-pwsh',
-  'dsh-web-app',
-  'dsh-workflow-worker-thread',
-]
-
-/** Confirm that an updated official Web profile still contains every product capability the desktop depends on. */
-export function assertRuntimeCapabilities(configOutput) {
-  const missing = REQUIRED_WEB_CAPABILITIES.filter(id => !configOutput.includes(`id: ${id}`))
-  if (missing.length > 0) throw new Error(`Harness Web profile is missing required capabilities: ${missing.join(', ')}`)
-}
-
-async function assertRuntimePackages(directory) {
-  const packageRoots = [
-    join(directory, 'node_modules', '@deepseek-ai'),
-    join(directory, 'node_modules', '@deepseek-ai', 'dsh', 'node_modules', '@deepseek-ai'),
-  ]
-  const missing = []
-  for (const packageName of REQUIRED_RUNTIME_PACKAGES) {
-    let found = false
-    for (const packageRoot of packageRoots) {
-      try {
-        await access(join(packageRoot, packageName, 'package.json'))
-        found = true
-        break
-      } catch {
-        // pnpm's hoisted linker may keep transitive packages beside dsh instead of at the project root.
-      }
-    }
-    if (!found) missing.push(packageName)
-  }
-  if (missing.length > 0) throw new Error(`Harness installation is missing required packages: ${missing.join(', ')}`)
+function isUnsupportedRuntimeArgument(error) {
+  return /unknown (?:command|option|argument)|unrecognized (?:option|argument)|unexpected argument/i.test(error.message)
 }
 
 async function reservePort() {
@@ -751,7 +694,7 @@ export class RuntimeManager {
   }
 
   runtimeEntry(version) {
-    return join(this.runtimeDirectory(version), 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+    return resolveRuntimeEntry(this.runtimeDirectory(version))
   }
 
   async isInstalledRuntimeReady(target, version) {
@@ -772,7 +715,6 @@ export class RuntimeManager {
     if (this.bundledRuntime?.version !== safeVersion) return undefined
     const source = this.bundledRuntime.archive
     const installDirectory = `${target}.bundled-${Date.now()}`
-    const verificationHome = join(installDirectory, '.verification-home')
     this.reportProgress({
       phase: 'install',
       title: `正在安装内置 Harness ${safeVersion}`,
@@ -789,30 +731,7 @@ export class RuntimeManager {
       await run('/usr/bin/tar', ['-xzf', source, '-C', installDirectory], {
         timeout: RUNTIME_INSTALL_TIMEOUT_MS,
       })
-      const sourcePackage = JSON.parse(await readFile(join(installDirectory, 'node_modules', '@deepseek-ai', 'dsh', 'package.json'), 'utf8'))
-      if (sourcePackage.version !== safeVersion) {
-        throw new Error(`Bundled Harness reported ${sourcePackage.version}, expected ${safeVersion}`)
-      }
-      await assertRuntimePackages(installDirectory)
-      const entry = join(installDirectory, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
-      const environment = this.runtimeEnvironment({ harnessHome: verificationHome, runtimeDirectory: installDirectory })
-      const versionCheck = await run(this.nodeBinary, this.runtimeNodeArgs([entry, '--version']), {
-        cwd: installDirectory,
-        env: environment,
-      })
-      if (versionCheck.stdout.trim() !== safeVersion) {
-        throw new Error(`Bundled Harness reported ${versionCheck.stdout.trim()}, expected ${safeVersion}`)
-      }
-      const configVerification = await run(this.nodeBinary, this.runtimeNodeArgs([entry, 'web', '--dump-default-config']), {
-        cwd: installDirectory,
-        env: environment,
-      })
-      assertRuntimeCapabilities(configVerification.stdout)
-      await removeRuntimePath(verificationHome, {
-        platform: this.platform,
-        required: false,
-        logger: this.logger,
-      })
+      await this.verifyRuntimeDirectory(installDirectory, safeVersion)
       await removeRuntimePath(target, { platform: this.platform, logger: this.logger })
       await rename(installDirectory, target)
       return target
@@ -900,16 +819,36 @@ export class RuntimeManager {
 
   async verifyRuntimeDirectory(directory, version) {
     await assertRuntimePackages(directory)
-    const verificationHome = join(directory, '.verification-home')
-    const entry = join(directory, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
-    const options = { cwd: directory, env: this.runtimeEnvironment({ harnessHome: verificationHome, runtimeDirectory: directory }) }
+    const verificationRoot = join(directory, '.verification-home')
+    const probe = new RuntimeManager({
+      root: verificationRoot, nodeBinary: this.nodeBinary, npmBinary: this.npmBinary,
+      pnpmBinary: this.pnpmBinary, toolDirectory: this.toolDirectory,
+      platform: this.platform, runtimePreload: this.runtimePreload, logger: this.logger,
+    })
+    const home = join(verificationRoot, 'home')
+    const entry = await resolveRuntimeEntry(directory)
+    const options = { cwd: directory, env: this.runtimeEnvironment({ harnessHome: home, runtimeDirectory: directory }) }
     try {
       const result = await run(this.nodeBinary, this.runtimeNodeArgs([entry, '--version']), options)
       if (result.stdout.trim() !== version) throw new Error('Runtime 版本与构建清单不一致')
-      const config = await run(this.nodeBinary, this.runtimeNodeArgs([entry, 'web', '--dump-default-config']), options)
-      assertRuntimeCapabilities(config.stdout)
+      // Dumping defaults is diagnostic; an upstream removal must not outweigh a real Web/API probe.
+      for (const prefix of [['web'], ['--profile', 'web']]) {
+        try {
+          const config = await run(this.nodeBinary, this.runtimeNodeArgs([entry, ...prefix, '--dump-default-config']), options)
+          assertRuntimeCapabilities(config.stdout)
+          break
+        } catch (error) {
+          if (!isUnsupportedRuntimeArgument(error)) throw error
+          this.logger.warn('Runtime does not support this default-config command; using alternate CLI and live compatibility checks')
+        }
+      }
+      this.reportProgress({ phase: 'verify', title: '正在验证 Runtime 兼容性',
+        message: '在独立临时目录验证启动、页面和会话接口', indeterminate: true })
+      const url = await probe.start(version, { runtimeDirectory: directory, harnessHome: home, cwd: verificationRoot })
+      await assertRuntimeWebReady(url)
     } finally {
-      await rm(verificationHome, { recursive: true, force: true })
+      await probe.stop()
+      await removeRuntimePath(verificationRoot, { platform: this.platform, required: false, logger: this.logger })
     }
   }
 
@@ -1001,35 +940,12 @@ export class RuntimeManager {
         }
       }
 
-      const entry = join(installDirectory, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
-      this.reportProgress({ phase: 'verify', title: '正在校验更新', message: '检查 Runtime 版本与完整能力', indeterminate: true })
-      await assertRuntimePackages(installDirectory)
-      const verificationHome = join(installDirectory, '.verification-home')
-      const verificationEnvironment = this.runtimeEnvironment({
-        harnessHome: verificationHome,
-        runtimeDirectory: installDirectory,
-      })
-      const verification = await run(this.nodeBinary, this.runtimeNodeArgs([entry, '--version']), {
-        cwd: installDirectory,
-        env: verificationEnvironment,
-      })
-      if (verification.stdout.trim() !== safeVersion) {
-        throw new Error(`Installed Harness reported ${verification.stdout.trim()}, expected ${safeVersion}`)
-      }
+      this.reportProgress({ phase: 'verify', title: '正在校验更新', message: '检查 Runtime 版本、依赖与运行兼容性', indeterminate: true })
+      await this.verifyRuntimeDirectory(installDirectory, safeVersion)
       await this.runTool(this.npmBinary, ['--version'], { env: this.runtimeEnvironment() })
       if (this.pnpmBinary !== undefined) {
         await this.runTool(this.pnpmBinary, ['--version'], { env: this.runtimeEnvironment() })
       }
-      const configVerification = await run(this.nodeBinary, this.runtimeNodeArgs([entry, 'web', '--dump-default-config']), {
-        cwd: installDirectory,
-        env: verificationEnvironment,
-      })
-      assertRuntimeCapabilities(configVerification.stdout)
-      await removeRuntimePath(verificationHome, {
-        platform: this.platform,
-        required: false,
-        logger: this.logger,
-      })
       if (this.platform === 'win32') {
         await writeFile(
           join(target, RUNTIME_READY_FILE),
@@ -1103,23 +1019,31 @@ export class RuntimeManager {
     return environment
   }
 
-  async start(version) {
+  async start(version, options = {}) {
     await this.stop()
     const safeVersion = assertSafeVersion(version)
-    const runtimeDirectory = this.runtimeDirectory(safeVersion)
-    const harnessHome = this.harnessHomeForVersion(safeVersion)
+    const runtimeDirectory = options.runtimeDirectory ?? this.runtimeDirectory(safeVersion)
+    const harnessHome = options.harnessHome ?? this.harnessHomeForVersion(safeVersion)
     await mkdir(harnessHome, { recursive: true })
-    const entry = this.runtimeEntry(safeVersion)
+    const entry = await resolveRuntimeEntry(runtimeDirectory)
     this.reportProgress({ phase: 'start', title: `正在启动 Harness ${safeVersion}`, message: '等待本机服务就绪', indeterminate: true })
-    const help = await run(this.nodeBinary, this.runtimeNodeArgs([entry, 'web', '--help']), {
-      cwd: process.env.DSH_DESKTOP_WORKSPACE || process.cwd(),
-      env: this.runtimeEnvironment({ harnessHome, runtimeDirectory }),
-    })
+    const environment = this.runtimeEnvironment({ harnessHome, runtimeDirectory })
+    const cwd = options.cwd ?? (process.env.DSH_DESKTOP_WORKSPACE || process.cwd())
+    let prefix = ['web']
+    let help
+    try {
+      help = await run(this.nodeBinary, this.runtimeNodeArgs([entry, ...prefix, '--help']), { cwd, env: environment })
+    } catch (error) {
+      if (!isUnsupportedRuntimeArgument(error)) throw error
+      prefix = ['--profile', 'web']
+      help = await run(this.nodeBinary, this.runtimeNodeArgs([entry, ...prefix, '--help']), { cwd, env: environment })
+    }
     const helpText = `${help.stdout}\n${help.stderr}`
     const port = runtimeSupportsDynamicPort(helpText) ? 0 : await reservePort()
     const webArgs = runtimeWebArgs(entry, port, helpText)
+    webArgs.splice(1, 1, ...prefix)
     const child = spawn(this.nodeBinary, this.runtimeNodeArgs(webArgs), {
-      cwd: process.env.DSH_DESKTOP_WORKSPACE || process.cwd(),
+      cwd: options.cwd ?? (process.env.DSH_DESKTOP_WORKSPACE || process.cwd()),
       env: this.runtimeEnvironment({ harnessHome, runtimeDirectory }),
       stdio: ['ignore', 'pipe', 'pipe'],
     })

@@ -5,8 +5,10 @@ import { mkdtemp, mkdir, writeFile, readFile, rm, symlink, access } from 'node:f
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import * as tar from 'tar'
-import { RuntimeManager, describeUpdate, REQUIRED_RUNTIME_PACKAGES, REQUIRED_WEB_CAPABILITIES } from '../src/runtime-manager.js'
+import { RuntimeManager, describeUpdate } from '../src/runtime-manager.js'
 import { parseRuntimeChannel, validateRuntimeArtifact, downloadRuntimeArtifact, extractRuntimeArchive, hashFile } from '../src/runtime-artifacts.js'
+
+import { writeRuntimeFixture } from './helpers/runtime-fixture.js'
 
 const artifact = (extra = {}) => ({ version: '0.1.3-alpha.1', tag: 'dsh-v0.1.3-alpha.1', commit: 'a'.repeat(40),
   build: 1, platform: 'darwin', arch: 'arm64', minDesktopVersion: '0.1.14', size: 3, sha256: createHash('sha256').update('abc').digest('hex'),
@@ -85,13 +87,8 @@ test('archive preflight rejects links escaping the runtime directory', async () 
 test('source artifact really installs from an archive and executes version and capability checks', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-source-install-'))
   try {
-    const source = join(root, 'source'); const entryRoot = join(source, 'node_modules/@deepseek-ai/dsh')
-    await mkdir(join(entryRoot, 'lib'), { recursive: true })
-    await writeFile(join(entryRoot, 'package.json'), JSON.stringify({ version: '0.1.3-alpha.1' }))
-    await writeFile(join(entryRoot, 'lib/bin.js'), `console.log(process.argv.includes('--version') ? '0.1.3-alpha.1' : ${JSON.stringify(REQUIRED_WEB_CAPABILITIES.map(id => `id: ${id}`).join('\n'))})`)
-    for (const pkg of REQUIRED_RUNTIME_PACKAGES) {
-      const dir = join(source, 'node_modules/@deepseek-ai', pkg); await mkdir(dir, { recursive: true }); await writeFile(join(dir, 'package.json'), '{}')
-    }
+    const source = join(root, 'source')
+    await writeRuntimeFixture(source, '0.1.3-alpha.1')
     const file = join(root, 'runtime.tgz'); await tar.c({ cwd: source, file, gzip: true }, ['node_modules'])
     const bytes = await readFile(file); const a = artifact({ size: bytes.length, sha256: await hashFile(file) })
     const m = runtime({ root: join(root, 'managed'), nodeBinary: process.execPath, directFetch: async () => new Response(bytes) })

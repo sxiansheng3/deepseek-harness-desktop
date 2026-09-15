@@ -1,7 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  assertRuntimeCapabilities,
   assertSafeVersion,
   conciseRuntimeStartupFailure,
   describeUpdate,
@@ -342,17 +341,6 @@ test('version-check failures report no installable runtime without throwing away
     assert.match(error.message, /暂时没有可安装/)
     return true
   })
-})
-
-test('rejects an update that drops a required official Web capability', () => {
-  const complete = [
-    'code-runtime', 'goal', 'llm-deepseek', 'permission', 'plan-mode',
-    'plugin-inventory', 'session-persistence-jsonl', 'skill-filesystem',
-    'subagent-spawn-in-process', 'tool-bash', 'tool-fs', 'tool-pwsh', 'tool-skill',
-    'tool-subagent', 'tool-web', 'tool-workflow', 'web-runtime',
-  ].map(id => `- id: ${id}`).join('\n')
-  assert.doesNotThrow(() => assertRuntimeCapabilities(complete))
-  assert.throws(() => assertRuntimeCapabilities(complete.replace('- id: tool-web', '')), /tool-web/)
 })
 
 test('uses native PATH delimiters for packaged tools on macOS and Windows', () => {

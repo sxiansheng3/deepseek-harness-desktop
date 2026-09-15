@@ -1,6 +1,6 @@
 {
   "name": "deepseek-harness-desktop",
-  "version": "0.1.16",
+  "version": "0.1.17",
   "private": true,
   "description": "Desktop shell with independently updatable DeepSeek Harness runtime",
   "author": "tao song",
@@ -10,12 +10,13 @@
     "start": "electron .",
     "icons:win": "node scripts/generate-windows-icon.mjs",
     "test": "node --test test/*.test.js",
-    "check": "node --check src/main.js && node --check src/runtime-manager.js && node --check src/bundled-runtime.js && node --check src/desktop-update-manager.js && node --check src/local-runtime-loader.js && node --check src/vision-compatibility-manager.js && node --check src/tool-layout.js && node --check src/menu.js && node --check src/preload.cjs && node --check src/windows-runtime-fs-shim.cjs && node --check src/runtime-artifacts.js && node --check scripts/build-source-runtime.mjs && node --check scripts/promote-runtime.mjs && node --check src/runtime-session-guard.js && node --check scripts/verify-source-runtime.mjs",
+    "check": "node --check src/main.js && node --check src/runtime-manager.js && node --check src/bundled-runtime.js && node --check src/desktop-update-manager.js && node --check src/local-runtime-loader.js && node --check src/vision-compatibility-manager.js && node --check src/tool-layout.js && node --check src/menu.js && node --check src/preload.cjs && node --check src/windows-runtime-fs-shim.cjs && node --check src/runtime-artifacts.js && node --check scripts/build-source-runtime.mjs && node --check scripts/promote-runtime.mjs && node --check src/runtime-session-guard.js && node --check scripts/verify-source-runtime.mjs && node --check src/runtime-validation.js && node --check scripts/verify-runtime-upgrade.mjs",
     "dist:mac": "electron-builder --config electron-builder.config.cjs --mac dmg zip --arm64",
     "dist:win": "electron-builder --config electron-builder.config.cjs --win nsis --x64",
     "runtime:build": "node scripts/build-source-runtime.mjs",
     "runtime:promote": "node scripts/promote-runtime.mjs",
-    "runtime:verify": "node scripts/verify-source-runtime.mjs"
+    "runtime:verify": "node scripts/verify-source-runtime.mjs",
+    "runtime:verify-upgrade": "node scripts/verify-runtime-upgrade.mjs"
   },
   "devDependencies": {
     "electron": "43.4.0",

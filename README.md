@@ -20,7 +20,7 @@ DeepSeek Harness Desktop is an Electron shell around the official, open-source D
 - Installs updates beside the active version, switches only after a successful start, and restarts the previous version after a failed start.
 - When a newer desktop build carries a newer bundled Runtime, upgrades an existing older Runtime from the local application resources before starting. A later user-installed Runtime is never downgraded.
 - Snapshots the Harness home before an update and exposes a one-click rollback that restores both the prior Runtime and its compatible data.
-- Verifies the official Web profile still contains the model, MCP, plan, persistence, Skill, subagent, terminal, filesystem, web, workflow, and UI capabilities before accepting an update.
+- Validates each Runtime against its own declared dependency graph, discovers its CLI entry, and probes a separate temporary Web process, authentication and session API before accepting an update. Internal package/plugin renames do not require a desktop release. See [Runtime compatibility](docs/RUNTIME-COMPATIBILITY.md).
 - Stops the Runtime when the desktop application quits.
 - Starts newer Harness Web Runtimes with their official `--no-open` switch so the desktop application does not also launch the default browser; older Runtimes are detected and remain compatible.
 - Lets newer Harness Runtimes ask the operating system for a free port directly, avoiding a reserve-then-release race during restart.

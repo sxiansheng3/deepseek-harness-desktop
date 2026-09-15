@@ -9,10 +9,10 @@ import { promisify } from 'node:util'
 import { bundledRuntimeStartupAction, loadBundledRuntime } from '../src/bundled-runtime.js'
 import {
   compareRuntimeVersions,
-  REQUIRED_RUNTIME_PACKAGES,
-  REQUIRED_WEB_CAPABILITIES,
   RuntimeManager,
 } from '../src/runtime-manager.js'
+
+import { writeRuntimeFixture } from './helpers/runtime-fixture.js'
 
 const execFileAsync = promisify(execFile)
 const TEST_SHA256 = 'a'.repeat(64)
@@ -65,23 +65,9 @@ test('installs and verifies the complete bundled Runtime without invoking npm', 
   const version = '0.1.2-alpha.2'
   const source = join(root, 'runtime-source')
   const archive = join(root, 'application-resources', 'bundled-runtime', `${version}.tar.gz`)
-  const dshRoot = join(source, 'node_modules', '@deepseek-ai', 'dsh')
   const progress = []
   try {
-    await mkdir(join(dshRoot, 'lib'), { recursive: true })
-    await writeFile(join(dshRoot, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version }))
-    const config = REQUIRED_WEB_CAPABILITIES.map(id => `- id: ${id}`).join('\\n')
-    await writeFile(join(dshRoot, 'lib', 'bin.js'), [
-      "const args = process.argv.slice(2)",
-      `if (args.includes('--version')) console.log('${version}')`,
-      `else if (args.includes('--dump-default-config')) console.log(${JSON.stringify(config)})`,
-      "else process.exitCode = 2",
-    ].join('\n'))
-    for (const packageName of REQUIRED_RUNTIME_PACKAGES) {
-      const packageRoot = join(source, 'node_modules', '@deepseek-ai', packageName)
-      await mkdir(packageRoot, { recursive: true })
-      await writeFile(join(packageRoot, 'package.json'), JSON.stringify({ name: `@deepseek-ai/${packageName}`, version }))
-    }
+    await writeRuntimeFixture(source, version)
     await mkdir(join(source, 'node_modules', '.bin'), { recursive: true })
     await symlink('../@deepseek-ai/dsh/lib/bin.js', join(source, 'node_modules', '.bin', 'dsh'))
     await mkdir(join(root, 'application-resources', 'bundled-runtime'), { recursive: true })
