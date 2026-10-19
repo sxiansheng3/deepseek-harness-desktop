@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+
 const TRANSIENT_LOCAL_LOAD_CODES = new Set([
   'ERR_FAILED',
   'ERR_CONNECTION_RESET',
@@ -17,6 +19,26 @@ function isLoopbackUrl(value) {
   } catch {
     return false
   }
+}
+
+export function isTrustedHarnessFrame(senderUrl, runtimeUrl) {
+  if (!isLoopbackUrl(runtimeUrl) || !isLoopbackUrl(senderUrl)) return false
+  return new URL(senderUrl).origin === new URL(runtimeUrl).origin
+}
+
+/** Old port-bound login cookies are sent to every new localhost port and can cause HTTP 431. */
+export async function removeStaleHarnessAuthCookies(cookieStore, runtimeUrl) {
+  if (!isLoopbackUrl(runtimeUrl)) return 0
+  const origin = new URL(runtimeUrl).origin
+  const currentName = 'dsh-auth-' + createHash('sha256').update(new URL(runtimeUrl).host).digest('base64url')
+  const cookies = await cookieStore.get({ url: origin })
+  let removed = 0
+  for (const cookie of cookies) {
+    if (!/^dsh-auth-[A-Za-z0-9_-]{43}$/.test(cookie.name) || cookie.name === currentName) continue
+    await cookieStore.remove(origin, cookie.name)
+    removed += 1
+  }
+  return removed
 }
 
 export function isTransientLocalLoadError(error, url) {

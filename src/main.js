@@ -1,6 +1,6 @@
 import { app, BrowserWindow, ipcMain, screen, session, shell } from 'electron'
 import { desktopDialogBounds, showDesktopDialog } from './desktop-dialog.js'
-import { assertRuntimeIdle } from './runtime-session-guard.js'
+import { assertRuntimeIdle, stopIdleRuntime } from './runtime-session-guard.js'
 import { randomUUID } from 'node:crypto'
 import { access } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -12,14 +12,25 @@ import {
 import { bundledRuntimeStartupAction, loadBundledRuntime } from './bundled-runtime.js'
 import { DesktopUpdateManager } from './desktop-update-manager.js'
 import { buildRuntimeUpdateDialogHtml, chineseReleaseNotes, runtimeUpdateDialogAction } from './runtime-update-dialog.js'
-import { isHiddenAcceptance, loadLocalRuntimeUrl } from './local-runtime-loader.js'
+import { isHiddenAcceptance, isTrustedHarnessFrame, loadLocalRuntimeUrl, removeStaleHarnessAuthCookies } from './local-runtime-loader.js'
 import { installApplicationMenu } from './menu.js'
 import { bundledToolDirectory, bundledToolPath } from './tool-layout.js'
+import { VisionCompatibilityManager } from './vision-compatibility-manager.js'
 import {
-  parseHarnessRequest,
-  selectedModelFromSessionModelsResponse,
-  VisionCompatibilityManager,
-} from './vision-compatibility-manager.js'
+  MODEL_CATALOG_ENDPOINT,
+  PROJECTIONS_ENDPOINT,
+  PROMPT_ENDPOINT,
+  compatibilityPromptText,
+  imageContentFromPromptRequest,
+  isPromptRequestUrl,
+  loopbackRequestUrlPatterns,
+  parseCapturedPromptRequest,
+  promptArgs,
+  rpcRequestBody,
+  rpcRequestUrl,
+  selectionFromModelCatalogPayload,
+  selectionFromProjectionPayload,
+} from './vision-bridge-protocol.js'
 import electronUpdater from 'electron-updater'
 
 const { autoUpdater } = electronUpdater
@@ -48,6 +59,30 @@ const recentImagePrompts = new Map()
 const visionFallbacks = new Set()
 const completedVisionFallbacks = new Set()
 const visionFallbackAttempts = new Map()
+// One visible error per captured prompt: a retry (or a repeated failure) must
+// not spam the status card, and a silent skip must not report anything at all.
+const reportedVisionErrors = new Set()
+// Observable escape hatch for the silent-degradation paths. The bridge must not
+// raise a banner when it cannot name the session's model, so it logs through
+// this switch instead: launch the desktop shell with
+// `DSH_DESKTOP_VISION_DEBUG=1` to read lines such as
+// `[desktop-vision] 当前会话未记录模型选择，跳过视觉桥接` and
+// `[desktop-vision] 无法读取当前会话模型，跳过视觉桥接：<reason>`.
+const VISION_DEBUG = process.env.DSH_DESKTOP_VISION_DEBUG === '1'
+// The original prompt has already been dispatched by the time the capture hook
+// runs; wait for its rejection before injecting the text-only replacement.
+const VISION_CAPTURE_SETTLE_MS = 450
+const MAX_VISION_FALLBACK_ATTEMPTS = 2
+const VISION_RETRY_WINDOW_MS = 60_000
+const VISION_FORGET_MS = 120_000
+
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error)
+}
+
+function visionDebug(message) {
+  if (VISION_DEBUG) console.debug(`[desktop-vision] ${message}`)
+}
 
 function resolveTool(name, override) {
   if (override) return override
@@ -107,7 +142,7 @@ function createWindow() {
 
 function assertTrustedHarnessSender(event) {
   const senderUrl = event.senderFrame?.url ?? ''
-  if (!senderUrl.startsWith('http://127.0.0.1:')) {
+  if (event.sender !== mainWindow?.webContents || !isTrustedHarnessFrame(senderUrl, runtime?.currentUrl)) {
     throw new Error('Desktop update controls are only available inside the local Harness UI')
   }
 }
@@ -117,66 +152,121 @@ function sendVisionStatus(status) {
   mainWindow.webContents.send('desktop-vision:status', status)
 }
 
-function harnessApiUrl(method) {
+function harnessApiUrl(endpoint) {
   if (runtime?.currentUrl === undefined) throw new Error('Harness Runtime 尚未就绪')
-  return new URL(`/api/${method}`, runtime.currentUrl)
+  // The gateway claims only `<namespace>/<method>` endpoints under `/api`.
+  return rpcRequestUrl(runtime.currentUrl, endpoint)
 }
 
 async function loadHarnessUrl(url) {
+  await removeStaleHarnessAuthCookies(session.defaultSession.cookies, url)
   return loadLocalRuntimeUrl(value => mainWindow.loadURL(value), url)
 }
 
-async function callHarness(method, payload) {
+/**
+ * Invoke one Harness connection RPC.
+ *
+ * The 0.2.x envelope is `{ type, rpcId, method, payload: { args } }`: the
+ * gateway's `remoteRequest()` insists on exactly one plain-object `args` field,
+ * and every method's named arguments live inside it. The bare request object a
+ * pre-0.2 shell sent is rejected before dispatch, so `args` is mandatory.
+ * @param endpoint - `<namespace>/<method>` endpoint.
+ * @param args - named arguments object; zero-parameter endpoints pass `{}`.
+ * @returns the decoded `result.value`.
+ */
+async function callHarness(endpoint, args = {}) {
   const rpcId = randomUUID()
-  const response = await session.defaultSession.fetch(harnessApiUrl(method), {
+  const response = await session.defaultSession.fetch(harnessApiUrl(endpoint), {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ type: 'client-request', rpcId, method, payload }),
+    body: JSON.stringify(rpcRequestBody(endpoint, rpcId, args)),
     signal: AbortSignal.timeout(30_000),
   })
-  if (!response.ok) throw new Error(`Harness ${method} 请求失败（HTTP ${response.status}）`)
+  if (!response.ok) throw new Error(`Harness ${endpoint} 请求失败（HTTP ${response.status}）`)
   const body = await response.json()
-  if (body?.type !== 'server-response' || body.rpcId !== rpcId) throw new Error(`Harness ${method} 返回了无效响应`)
-  if (body.result?.ok !== true) throw new Error(body.result?.error?.message ?? `Harness ${method} 请求被拒绝`)
-  return body
+  if (body?.type !== 'server-response' || body.rpcId !== rpcId) throw new Error(`Harness ${endpoint} 返回了无效响应`)
+  if (body.result?.ok !== true) throw new Error(body.result?.error?.message ?? `Harness ${endpoint} 请求被拒绝`)
+  return body.result.value
 }
 
-function imagePromptContent(request) {
-  return Array.isArray(request?.payload?.content)
-    ? request.payload.content.filter(part => part?.type === 'text' || part?.type === 'image')
-    : []
+/**
+ * Resolve the model this session will actually answer with.
+ *
+ * `session/projections` exposes `modelSelection.next` (`pending ?? lastUsed`),
+ * the same order the Controller uses — pending selection first, then the last
+ * recorded request header. A session that never recorded a selection answers
+ * with the deployment default, which `session/modelCatalog` publishes. Both
+ * reads are model-free of side effects. Returns `undefined` when neither read
+ * can name a model, which callers must treat as "skip silently".
+ * @param sessionId - the session the captured prompt targets.
+ * @returns `{ provider, model }`, or `undefined`.
+ */
+async function resolveSessionModel(sessionId) {
+  const projections = await callHarness(PROJECTIONS_ENDPOINT, { request: { sessionId } })
+  const projected = selectionFromProjectionPayload(projections)
+  if (projected !== undefined) return projected
+  const catalog = await callHarness(MODEL_CATALOG_ENDPOINT, {})
+  return selectionFromModelCatalogPayload(catalog)
 }
 
-async function bridgeImagePrompt(request, { force = false } = {}) {
-  if (visionCompatibility === undefined || visionFallbacks.has(request.rpcId)) return false
-  if (completedVisionFallbacks.has(request.rpcId)) return true
-  const content = imagePromptContent(request)
+function reportVisionError(rpcId, error) {
+  const message = errorMessage(error)
+  visionDebug(`视觉桥接失败：${message}`)
+  if (reportedVisionErrors.has(rpcId)) return
+  reportedVisionErrors.add(rpcId)
+  sendVisionStatus({ state: 'error', message })
+}
+
+async function bridgeImagePrompt(capture, { force = false } = {}) {
+  if (visionCompatibility === undefined) return false
+  const rpcId = capture?.rpcId
+  if (typeof rpcId !== 'string' || rpcId.length === 0) return false
+  if (visionFallbacks.has(rpcId)) return false
+  if (completedVisionFallbacks.has(rpcId)) return true
+  const content = imageContentFromPromptRequest(capture.request)
   if (!content.some(part => part?.type === 'image')) return false
-  visionFallbacks.add(request.rpcId)
+  visionFallbacks.add(rpcId)
   try {
-    const modelsResponse = await callHarness('session.models', { sessionId: request.payload.sessionId })
-    const selected = selectedModelFromSessionModelsResponse(modelsResponse)
-    if (selected === undefined) throw new Error('无法确定当前会话使用的模型')
-    if (!force && await visionCompatibility.routeDeclaresImage(selected.provider, selected.model)) return false
-    const attempts = visionFallbackAttempts.get(request.rpcId) ?? 0
-    if (attempts >= 2) return false
-    visionFallbackAttempts.set(request.rpcId, attempts + 1)
+    let selected
+    try {
+      selected = await resolveSessionModel(capture.request.sessionId)
+    } catch (error) {
+      // A runtime without these methods (or an unavailable session) must not
+      // turn into an error banner: the prompt already failed on its own.
+      // Silent by design — `DSH_DESKTOP_VISION_DEBUG=1` makes the skip visible.
+      visionDebug(`无法读取当前会话模型，跳过视觉桥接：${errorMessage(error)}`)
+      return false
+    }
+    if (selected === undefined) {
+      // Same contract: no model, no bridge, no banner. The debug switch above
+      // is the only observable trace of this path.
+      visionDebug('当前会话未记录模型选择，跳过视觉桥接')
+      return false
+    }
+    let declaresImage = false
+    try {
+      declaresImage = await visionCompatibility.routeDeclaresImage(selected.provider, selected.model)
+    } catch (error) {
+      visionDebug(`读取图片能力声明失败，按未声明处理：${errorMessage(error)}`)
+    }
+    if (!force && declaresImage) return false
+    const attempts = visionFallbackAttempts.get(rpcId) ?? 0
+    if (attempts >= MAX_VISION_FALLBACK_ATTEMPTS) {
+      visionDebug('视觉桥接重试次数已达上限，跳过')
+      return false
+    }
+    visionFallbackAttempts.set(rpcId, attempts + 1)
     sendVisionStatus({ state: 'bridging', provider: selected.provider, model: selected.model })
     const analysis = await visionCompatibility.analyzeAndRemember({ ...selected, content })
-    const originalQuestion = content.filter(part => part?.type === 'text').map(part => part.text).join('\n').trim()
-    const compatibilityPrompt = [
-      '[DeepSeek Harness Desktop 视觉兼容层]',
-      '桌面端已经使用当前模型成功读取了用户本次上传的图片。请直接依据下面的视觉结果回答用户，不要声称无法看到图片，也不要要求用户重复上传。',
-      originalQuestion ? `用户原问题：\n${originalQuestion}` : '用户原问题：请描述上传的图片。',
-      `视觉读取结果：\n${analysis}`,
-    ].join('\n\n')
-    await callHarness('session.prompt', {
-      sessionId: request.payload.sessionId,
-      mode: request.payload.mode === 'steer' ? 'steer' : 'queue',
-      content: [{ type: 'text', text: compatibilityPrompt }],
-      ...(typeof request.payload.clientTimeZone === 'string' ? { clientTimeZone: request.payload.clientTimeZone } : {}),
-    })
-    completedVisionFallbacks.add(request.rpcId)
+    const question = content.filter(part => part?.type === 'text').map(part => part.text).join('\n')
+    await callHarness(PROMPT_ENDPOINT, promptArgs({
+      requestId: randomUUID(),
+      sessionId: capture.request.sessionId,
+      mode: capture.request.mode,
+      content: [{ type: 'text', text: compatibilityPromptText({ question, analysis }) }],
+      clientTimeZone: capture.request.clientTimeZone,
+    }))
+    completedVisionFallbacks.add(rpcId)
     sendVisionStatus({
       state: 'complete',
       provider: selected.provider,
@@ -185,30 +275,40 @@ async function bridgeImagePrompt(request, { force = false } = {}) {
     })
     return true
   } catch (error) {
-    sendVisionStatus({ state: 'error', message: error instanceof Error ? error.message : String(error) })
+    reportVisionError(rpcId, error)
     return false
   } finally {
-    visionFallbacks.delete(request.rpcId)
+    visionFallbacks.delete(rpcId)
   }
 }
 
 function installVisionPromptCapture() {
+  // Match patterns carry no port, so the filter is the loopback origin and the
+  // exact `/api/session/prompt` path is asserted per request.
   session.defaultSession.webRequest.onBeforeRequest(
-    { urls: ['http://127.0.0.1:*/api/session.prompt*'] },
+    { urls: loopbackRequestUrlPatterns() },
     details => {
+      if (!isPromptRequestUrl(details.url)) return
       const chunks = details.uploadData?.flatMap(item => item.bytes === undefined ? [] : [Buffer.from(item.bytes)]) ?? []
       if (chunks.length === 0) return
-      const bytes = Buffer.concat(chunks)
-      const request = parseHarnessRequest(bytes)
-      if (request === undefined || !imagePromptContent(request).some(part => part?.type === 'image')) return
-      recentImagePrompts.set(details.webContentsId, { request, capturedAt: Date.now() })
-      setTimeout(() => { void bridgeImagePrompt(request) }, 450)
+      let envelope
+      try {
+        envelope = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      } catch {
+        return
+      }
+      const capture = parseCapturedPromptRequest(envelope)
+      if (capture === undefined) return
+      if (!imageContentFromPromptRequest(capture.request).some(part => part?.type === 'image')) return
+      recentImagePrompts.set(details.webContentsId, { capture, capturedAt: Date.now() })
+      setTimeout(() => { void bridgeImagePrompt(capture) }, VISION_CAPTURE_SETTLE_MS)
       setTimeout(() => {
         const recent = recentImagePrompts.get(details.webContentsId)
-        if (recent?.request.rpcId === request.rpcId) recentImagePrompts.delete(details.webContentsId)
-        completedVisionFallbacks.delete(request.rpcId)
-        visionFallbackAttempts.delete(request.rpcId)
-      }, 120_000)
+        if (recent?.capture.rpcId === capture.rpcId) recentImagePrompts.delete(details.webContentsId)
+        completedVisionFallbacks.delete(capture.rpcId)
+        visionFallbackAttempts.delete(capture.rpcId)
+        reportedVisionErrors.delete(capture.rpcId)
+      }, VISION_FORGET_MS)
     },
   )
 }
@@ -245,8 +345,8 @@ function installDesktopUpdateIpc() {
   ipcMain.handle('desktop-vision:retry-last', async event => {
     assertTrustedHarnessSender(event)
     const recent = recentImagePrompts.get(event.sender.id)
-    if (recent === undefined || Date.now() - recent.capturedAt > 60_000) return false
-    return bridgeImagePrompt(recent.request, { force: true })
+    if (recent === undefined || Date.now() - recent.capturedAt > VISION_RETRY_WINDOW_MS) return false
+    return bridgeImagePrompt(recent.capture, { force: true })
   })
 }
 
@@ -393,14 +493,14 @@ async function startDesktopApplicationUpdate({ skipConfirmation = false } = {}) 
       if (runtime?.currentUrl && !mainWindow.isDestroyed()) await loadHarnessUrl(runtime.currentUrl)
       return
     }
-    await runtime.stop()
+    await stopIdleRuntime(runtime)
     shuttingDown = true
     desktopUpdater.quitAndInstall()
   } catch (error) {
     await showMessageDialog(mainWindow, {
       type: 'error',
       title: '桌面版更新失败',
-      message: '桌面版安装包没有下载完成，当前版本未被替换。',
+      message: '桌面版更新未完成，当前版本未被替换。',
       detail: formatUpdateFailure(error, status.update.version),
       buttons: ['返回 Harness'],
     })

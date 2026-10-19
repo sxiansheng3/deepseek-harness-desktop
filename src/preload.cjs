@@ -128,7 +128,7 @@ function renderDesktopUpdateBadge(status) {
   button.querySelector('span').textContent = `桌面版 ${status.update.version} 可更新`
   button.addEventListener('click', () => {
     button.disabled = true
-    void desktopHarness.startDesktopUpdate().catch(() => { button.disabled = false })
+    void desktopHarness.startDesktopUpdate().catch(() => {}).finally(() => { button.disabled = false })
   })
   document.body.appendChild(button)
 }
@@ -181,7 +181,7 @@ async function renderDesktopSettings(dialog, desktopButton) {
         </div>
         <div class="dsh-desktop-label">原生优先 · 自动回退</div>
       </div>
-      <div class="dsh-desktop-status">兼容优先：模型未明确声明能力时允许尝试图片；明确的纯文本声明仍会保留。Harness 更新后会自动重新应用。</div>
+      <div class="dsh-desktop-status">兼容优先：模型未明确声明能力时允许尝试图片；明确的纯文本声明仍会保留。新增或未声明的模型会自动补齐声明（覆盖 profile 的 cordis.patch.yml 与旧版 settings.yaml），Harness 更新后自动重新应用。</div>
     </div>
   `
   options.appendChild(panel)
@@ -211,9 +211,22 @@ async function renderDesktopSettings(dialog, desktopButton) {
       status.textContent = '更新检查暂时不可用，请稍后重试。'
     })
     const images = desktopHarness.getVisionStatus().then(result => {
-      vision.textContent = result.models.length === 0
+      const verified = Array.isArray(result.models) ? result.models : []
+      const optimistic = typeof result.optimisticModels === 'number'
+        ? result.optimisticModels
+        : Array.isArray(result.optimisticModels)
+          ? result.optimisticModels.length
+          : Array.isArray(result.optimistic)
+            ? result.optimistic.length
+            : 0
+      const sources = Array.isArray(result.sources) ? result.sources : []
+      const lines = []
+      if (optimistic > 0) lines.push(`图片兼容已覆盖 ${optimistic} 个可尝试图片的模型`)
+      if (sources.length > 0) lines.push(`声明来源：${sources.map(item => item.profile ?? item.kind ?? item.path).join('、')}`)
+      lines.push(verified.length === 0
         ? '尚无已验证模型；首次上传时自动验证并回退'
-        : `已验证 ${result.models.length} 个：${result.models.map(item => `${item.provider}/${item.model}`).join('、')}`
+        : `已验证 ${verified.length} 个：${verified.map(item => `${item.provider}/${item.model}`).join('、')}`)
+      vision.textContent = lines.join('；')
     }).catch(() => { vision.textContent = '图片兼容状态暂时无法读取，请重新打开设置。' })
     await Promise.allSettled([local, remote, images])
   }

@@ -149,6 +149,8 @@ export class DesktopUpdateManager {
 
   async download() {
     if (!this.enabled || !this.status.available) throw new Error('当前没有可下载的桌面版更新')
+    if (this.downloadInFlight) throw new Error('桌面版更新正在下载，请勿重复操作')
+    this.downloadInFlight = true
     const update = this.status.update
     const routes = [
       { kind: 'system', label: '系统网络（含代理）' },
@@ -174,7 +176,11 @@ export class DesktopUpdateManager {
         }
       }
       return this.status
+    } catch (error) {
+      this.setStatus({ available: true, state: 'error', update, error: error.message })
+      throw error
     } finally {
+      this.downloadInFlight = false
       await this.restoreSystemNetwork()
     }
   }

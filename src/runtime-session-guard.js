@@ -1,5 +1,11 @@
 import { randomUUID } from 'node:crypto'
 
+/** Desktop-shell replacement must honor the same task guard as a Runtime switch. */
+export async function stopIdleRuntime(runtime) {
+  await runtime.assertCanSwitch()
+  await runtime.stop()
+}
+
 /** Read the runtime's authoritative session list before stopping it for an update. */
 export async function assertRuntimeIdle(url, fetcher) {
   if (!url) return

@@ -6,6 +6,7 @@ import { access, cp, lstat, mkdir, readFile, readdir, rename, rm, stat, writeFil
 import { dirname, join } from 'node:path'
 import { assertRuntimeCapabilities, assertRuntimePackages, assertRuntimeWebReady, resolveRuntimeEntry } from './runtime-validation.js'
 import { RUNTIME_CHANNEL_URL, parseRuntimeChannel, downloadRuntimeArtifact, extractRuntimeArchive } from './runtime-artifacts.js'
+import { assertRuntimePublication } from './runtime-publication.js'
 
 const PACKAGE_NAME = '@deepseek-ai/dsh'
 export const RUNTIME_REGISTRY_URL = 'https://registry.npmjs.org/@deepseek-ai%2fdsh'
@@ -352,6 +353,9 @@ export function runtimeInstallPlan(npmBinary, version) {
       '--no-audit',
       '--no-fund',
       '--package-lock=false',
+      '--prefer-online',
+      '--registry=https://registry.npmjs.org',
+      '--@deepseek-ai:registry=https://registry.npmjs.org',
       `${PACKAGE_NAME}@${safeVersion}`,
     ],
   }
@@ -581,7 +585,7 @@ export class RuntimeManager {
     return (await this.getLatestRelease()).version
   }
 
-  async fetchOfficialResource(url, { accept, label, parse, allowMissing = false }) {
+  async fetchOfficialResource(url, { accept, label, parse, allowMissing = false, missingValue }) {
     const attempts = [
       ...(this.systemFetch ? [{ label: '系统网络（含代理）', fetcher: this.systemFetch }] : []),
       { label: '直接连接', fetcher: this.directFetch },
@@ -593,10 +597,11 @@ export class RuntimeManager {
           headers: {
             accept,
             'user-agent': 'DeepSeek-Harness-Desktop',
+            'cache-control': 'no-cache',
           },
           signal: AbortSignal.timeout(15_000),
         })
-        if (allowMissing && response.status === 404) return { schemaVersion: 1, releases: [] }
+        if (allowMissing && response.status === 404) return missingValue === undefined ? { schemaVersion: 1, releases: [] } : missingValue
         if (!response.ok) throw new Error(`${label} returned HTTP ${response.status}`)
         return await parse(response)
       } catch (error) {
@@ -604,6 +609,18 @@ export class RuntimeManager {
       }
     }
     throw stageError('check', `无法读取${label}`, attemptFailures.at(-1)?.error, { attemptFailures })
+  }
+
+  publicationLoader(cache = new Map()) {
+    return (name, version) => {
+      const key = `${name}@${version}`
+      if (!cache.has(key)) cache.set(key, this.fetchOfficialResource(
+        `https://registry.npmjs.org/${encodeURIComponent(name)}/${encodeURIComponent(version)}`, {
+          accept: 'application/json', label: key, allowMissing: true, missingValue: null,
+          parse: response => response.json(),
+        }))
+      return cache.get(key)
+    }
   }
 
   async getReleaseCatalog() {
@@ -640,8 +657,25 @@ export class RuntimeManager {
       .sort((a, b) => compareRuntimeVersions(b.version, a.version)
         || (a.source === b.source ? (b.build ?? 0) - (a.build ?? 0) : a.source === 'npm' ? -1 : 1))
     const published = [...releases].sort((a, b) => compareRuntimeVersions(b.version, a.version))[0]
-    return { published, candidate: candidates[0], warnings,
-      checkComplete: results.every(result => result.status === 'fulfilled'),
+    const loadManifest = this.publicationLoader()
+    const unavailable = []
+    let publicationCheckFailed = false
+    let candidate
+    for (const item of candidates) {
+      if (item.source === 'npm') {
+        try { await assertRuntimePublication(metadata.versions[item.version], loadManifest) }
+        catch (error) {
+          publicationCheckFailed ||= error.code !== 'RUNTIME_PUBLICATION_INCOMPLETE'
+          unavailable.push({ version: item.version, reason: error.message })
+          warnings.push(`${item.version} 暂不可安装：${error.message}`)
+          continue
+        }
+      }
+      candidate = item
+      break
+    }
+    return { published, candidate, warnings, unavailable,
+      checkComplete: !publicationCheckFailed && results.every(result => result.status === 'fulfilled'),
       latestNpmVersion: npm.sort((a, b) => compareRuntimeVersions(b.version, a.version))[0]?.version }
   }
 
@@ -668,7 +702,7 @@ export class RuntimeManager {
     const candidate = catalog.candidate
     const update = { ...local, ...describeUpdate(local.activeVersion, candidate?.version),
       latestPublishedVersion: catalog.published?.version, latestInstallableVersion: candidate?.version,
-      latestNpmVersion: catalog.latestNpmVersion, candidate, warnings: catalog.warnings, checkComplete: catalog.checkComplete }
+      latestNpmVersion: catalog.latestNpmVersion, candidate, warnings: catalog.warnings, unavailable: catalog.unavailable, checkComplete: catalog.checkComplete }
     const awaitingBuild = catalog.published && (!candidate || compareRuntimeVersions(catalog.published.version, candidate.version) > 0)
     update.message = update.available
       ? `可更新到 ${candidate.version}（${candidate.source === 'npm' ? '官方 npm' : '基于官方源码构建'}）。`
@@ -678,7 +712,8 @@ export class RuntimeManager {
     if (awaitingBuild) update.message += ` 官方已发布 ${catalog.published.version}，对应安装包尚未就绪。`
     if (catalog.warnings.length) {
       if (!candidate && !catalog.published) update.message = '更新检查暂时不可用，请检查网络后重试。当前版本仍可继续使用。'
-      else update.message += ' 部分更新源暂时无法检查，当前结果可能不完整。'
+      else if (!catalog.checkComplete) update.message += ' 部分更新源暂时无法检查，当前结果可能不完整。'
+      if (catalog.unavailable?.length) update.message += ` ${catalog.unavailable[0].version} 的依赖尚未就绪或无法确认，暂不提供安装。`
     }
     if (update.available && candidate.body) update.releaseNotes = { title: candidate.title, body: candidate.body, url: candidate.url }
     // Build download URLs are not release-note URLs.
@@ -701,12 +736,19 @@ export class RuntimeManager {
     try {
       const packageJson = JSON.parse(await readFile(join(target, 'node_modules', '@deepseek-ai', 'dsh', 'package.json'), 'utf8'))
       if (packageJson.version !== version) return false
-      if (this.platform !== 'win32') return true
-      const ready = JSON.parse(await readFile(join(target, RUNTIME_READY_FILE), 'utf8'))
-      return ready.version === version
+      try {
+        const ready = JSON.parse(await readFile(join(target, RUNTIME_READY_FILE), 'utf8'))
+        return ready.version === version
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error
+        if (this.platform === 'win32') return false
+        // Older macOS installs predate the marker; a lone package.json is not proof of a complete tree.
+        await assertRuntimePackages(target)
+        await resolveRuntimeEntry(target)
+        return true
+      }
     } catch (error) {
-      if (error?.code === 'ENOENT' || error instanceof SyntaxError) return false
-      throw error
+      return false
     }
   }
 
@@ -729,9 +771,10 @@ export class RuntimeManager {
       await removeRuntimePath(installDirectory, { platform: this.platform, logger: this.logger })
       await mkdir(installDirectory, { recursive: true })
       await run('/usr/bin/tar', ['-xzf', source, '-C', installDirectory], {
-        timeout: RUNTIME_INSTALL_TIMEOUT_MS,
+        timeoutMs: RUNTIME_INSTALL_TIMEOUT_MS,
       })
       await this.verifyRuntimeDirectory(installDirectory, safeVersion)
+      await writeFile(join(installDirectory, RUNTIME_READY_FILE), JSON.stringify({ version: safeVersion, source: 'bundled', verifiedAt: new Date().toISOString() }) + '\n')
       await removeRuntimePath(target, { platform: this.platform, logger: this.logger })
       await rename(installDirectory, target)
       return target
@@ -863,6 +906,15 @@ export class RuntimeManager {
     const bundledTarget = await this.installBundledRuntime(safeVersion, target)
     if (bundledTarget !== undefined) return bundledTarget
 
+    try {
+      const loadManifest = this.publicationLoader()
+      const manifest = await loadManifest(PACKAGE_NAME, safeVersion)
+      if (!manifest || manifest.name !== PACKAGE_NAME || manifest.version !== safeVersion) throw new Error('官方 Runtime 版本清单不存在或身份不匹配')
+      await assertRuntimePublication(manifest, loadManifest)
+    } catch (error) {
+      throw stageError('check', `Harness ${safeVersion} 安装前检查未通过`, error)
+    }
+
     const installDirectory = runtimeInstallDirectory(target, this.platform)
     const proxyResolution = await this.resolveProxy?.(RUNTIME_REGISTRY_URL).catch(error => {
       this.logger.warn(`Unable to resolve system proxy: ${error instanceof Error ? error.message : String(error)}`)
@@ -946,12 +998,11 @@ export class RuntimeManager {
       if (this.pnpmBinary !== undefined) {
         await this.runTool(this.pnpmBinary, ['--version'], { env: this.runtimeEnvironment() })
       }
-      if (this.platform === 'win32') {
-        await writeFile(
-          join(target, RUNTIME_READY_FILE),
+      await writeFile(
+          join(installDirectory, RUNTIME_READY_FILE),
           JSON.stringify({ version: safeVersion, verifiedAt: new Date().toISOString() }, null, 2) + '\n',
         )
-      } else {
+      if (this.platform !== 'win32') {
         this.reportProgress({ phase: 'activate', title: '正在启用更新', message: '切换到已校验的新 Runtime', indeterminate: true })
         await removeRuntimePath(target, { platform: this.platform, logger: this.logger })
         await rename(installDirectory, target)
